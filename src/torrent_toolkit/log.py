@@ -9,7 +9,12 @@ import logging
 import sys
 import time
 
-_STANDARD_ATTRS = set(vars(logging.makeLogRecord({}))) | {"message", "asctime", "taskName"}
+_STANDARD_ATTRS = set(vars(logging.makeLogRecord({}))) | {
+    "message",
+    "asctime",
+    "taskName",
+    "color_message",  # uvicorn
+}
 
 
 def _fmt_value(value: object) -> str:
@@ -24,7 +29,9 @@ class KeyValueFormatter(logging.Formatter):
         ts = self.formatTime(record, "%Y-%m-%dT%H:%M:%SZ")
         parts = [ts, record.levelname, record.name, _fmt_value(record.getMessage())]
         parts += [
-            f"{k}={_fmt_value(v)}" for k, v in vars(record).items() if k not in _STANDARD_ATTRS
+            f"{k}={_fmt_value(v)}"
+            for k, v in vars(record).items()
+            if k not in _STANDARD_ATTRS and not k.startswith("__")
         ]
         line = " ".join(parts)
         if record.exc_info:
@@ -38,5 +45,7 @@ def setup(level: str = "INFO") -> None:
     root = logging.getLogger()
     root.handlers[:] = [handler]
     root.setLevel(level)
-    for noisy in ("httpx", "httpcore", "urllib3"):
+    for noisy in ("httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    # Connection failures are reported once by the daemon; urllib3's retry chatter is noise.
+    logging.getLogger("urllib3").setLevel(logging.ERROR)

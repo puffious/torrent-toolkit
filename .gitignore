@@ -7,3 +7,7 @@ __pycache__/
 dist/
 config/
 *.db
+tests/integration/qbit-config/*
+!tests/integration/qbit-config/qBittorrent/
+tests/integration/qbit-config/qBittorrent/*
+!tests/integration/qbit-config/qBittorrent/qBittorrent.conf
