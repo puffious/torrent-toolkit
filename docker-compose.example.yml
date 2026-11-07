@@ -1,0 +1,45 @@
+# Example: qBittorrent + torrent-toolkit sharing identical mounts.
+# /data  → downloads (same path inside both containers)
+# /mount → rclone mount (library); mounted on the host, propagated into the containers
+services:
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+      - WEBUI_PORT=8080
+    volumes:
+      - ./qbittorrent:/config
+      - /data:/data
+    ports:
+      - 8080:8080
+      - 6881:6881
+      - 6881:6881/udp
+    restart: unless-stopped
+
+  torrent-toolkit:
+    build: .
+    depends_on: [qbittorrent]
+    user: "1000:1000"
+    environment:
+      - TK_QBIT_URL=http://qbittorrent:8080
+      - TK_QBIT_USER=admin
+      - TK_QBIT_PASS=changeme
+      - TK_LIBRARY_PATH=/mount
+      - TK_REVIEW_PATH=/data/review
+      - TK_TMDB_API_KEY=
+      - TK_SPLIT_RESERVE=2GB
+      - TK_SPOOF_SPEED=1mbps
+      - TK_SPOOF_JITTER=40%
+      - TK_SPOOF_TARGET_RATIO=2.0
+      - TK_SPOOF_MAX_DURATION=14d
+      # - TK_SPLIT_HOOK=rclone move --files-from "$TK_FILES" / remote:dump
+      # - TK_NOTIFY_URLS=ntfy://ntfy.sh/my-topic,discord://id/token
+    volumes:
+      - ./toolkit:/config
+      - /data:/data
+      - /mount:/mount:rslave
+    ports:
+      - 8090:8080
+    restart: unless-stopped
