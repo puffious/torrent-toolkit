@@ -1,0 +1,123 @@
+"""Organize a torrent's files into the library: plan, move, record, report."""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from torrent_toolkit.db import Database
+from torrent_toolkit.organize.layout import MOVIES_DIR, SHOWS_DIR, Action, Finder, Planner
+from torrent_toolkit.organize.mover import Collision, move_file, move_to_review, prune_empty_dirs
+
+log = logging.getLogger(__name__)
+
+
+class LibraryUnavailable(Exception):
+    """The library folders are missing — most likely the rclone mount is down."""
+
+
+@dataclass
+class OrganizeResult:
+    moved: int = 0
+    duplicates: int = 0
+    deleted: int = 0
+    review: list[tuple[str, str]] = field(default_factory=list)  # (relative path, reason)
+
+
+class Organizer:
+    def __init__(self, db: Database, library: Path, review: Path, finder: Finder | None):
+        self.db = db
+        self.library = library
+        self.review = review
+        self.planner = Planner(library, finder)
+
+    def check_library(self) -> None:
+        missing = [d for d in (MOVIES_DIR, SHOWS_DIR) if not (self.library / d).is_dir()]
+        if len(missing) == 2:
+            raise LibraryUnavailable(
+                f"{self.library} has no '{MOVIES_DIR}/' or '{SHOWS_DIR}/' folder "
+                "(is the rclone mount up?)"
+            )
+
+    def organize(
+        self,
+        hash: str,
+        save_path: str,
+        all_files: dict[int, str],
+        indexes: list[int],
+    ) -> OrganizeResult:
+        """Organize `indexes` out of `all_files` (index → relative path).
+
+        All files are planned so subtitles and extras can be paired with videos that are
+        in other split batches. Files already recorded as organized are skipped, so a rerun
+        after a crash or failure is safe. Raises `LibraryUnavailable` or I/O / network errors;
+        the caller retries later.
+        """
+        self.check_library()
+        plans = self.planner.plan(all_files)
+        done = self.db.organized_indexes(hash)
+        base = Path(save_path)
+        result = OrganizeResult()
+        touched_dirs: set[Path] = set()
+
+        for i in sorted(indexes):
+            if i in done:
+                continue
+            rel = all_files[i]
+            src = base / rel
+            plan = plans[i]
+
+            if not src.exists():
+                log.warning("file missing, skipped", extra={"hash": hash, "file": rel})
+                self.db.record_organized(hash, i, str(src), None, "missing")
+                continue
+
+            if plan.action is Action.DELETE:
+                src.unlink()
+                result.deleted += 1
+                self.db.record_organized(hash, i, str(src), None, "deleted")
+            elif plan.action is Action.MOVE:
+                try:
+                    outcome = move_file(src, plan.dest)
+                except Collision as e:
+                    self._to_review(hash, i, rel, src, str(e), result)
+                else:
+                    if outcome == "duplicate":
+                        result.duplicates += 1
+                    else:
+                        result.moved += 1
+                    self.db.record_organized(hash, i, str(src), str(plan.dest), outcome)
+            else:
+                self._to_review(hash, i, rel, src, plan.reason or "", result)
+            touched_dirs.add(src.parent)
+
+        for d in touched_dirs:
+            prune_empty_dirs(d, base)
+        log.info(
+            "organized",
+            extra={
+                "hash": hash,
+                "moved": result.moved,
+                "duplicates": result.duplicates,
+                "deleted": result.deleted,
+                "review": len(result.review),
+            },
+        )
+        return result
+
+    def _to_review(
+        self,
+        hash: str,
+        index: int,
+        rel: str,
+        src: Path,
+        reason: str,
+        result: OrganizeResult,
+    ) -> None:
+        rel_path = Path(rel)
+        # Multi-file torrents already start with their root folder; give single files one.
+        target = rel_path if len(rel_path.parts) > 1 else Path(rel_path.stem) / rel_path
+        dest = move_to_review(src, self.review / target)
+        result.review.append((rel, reason))
+        self.db.record_organized(hash, index, str(src), str(dest), "review", reason)

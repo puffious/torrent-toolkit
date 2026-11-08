@@ -35,8 +35,8 @@ class DiskUsage:
         return usage.total, usage.free
 
 
-# (torrent, tracked, completed files) → None; raises on failure.
-Offloader = Callable[[TorrentInfo, TrackedTorrent, list[FileInfo]], None]
+# (torrent, tracked, completed batch files, all files) → None; raises on failure.
+Offloader = Callable[[TorrentInfo, TrackedTorrent, list[FileInfo], list[FileInfo]], None]
 
 
 def run_hook(command: str, t: TorrentInfo, files: list[FileInfo]) -> None:
@@ -73,7 +73,7 @@ class SplitRunner:
         notifier: Notifier,
         *,
         reserve: int,
-        offload: Offloader | None,
+        offload: Offloader,
         disk_usage: Callable[[str], tuple[int, int]] | None = None,
         clock: Callable[[], float] = time.time,
         executor: ThreadPoolExecutor | None = None,
@@ -87,6 +87,7 @@ class SplitRunner:
         self.clock = clock
         self._executor = executor or ThreadPoolExecutor(max_workers=1, thread_name_prefix="offload")
         self._offloads: dict[str, Future] = {}
+        self._failing: set[str] = set()  # notify once per failure streak
 
     def shutdown(self) -> None:
         self._executor.shutdown(wait=True)
@@ -193,9 +194,11 @@ class SplitRunner:
             },
         )
 
-    def _batch_files(self, t: TorrentInfo) -> list[FileInfo]:
+    def _batch_files(
+        self, t: TorrentInfo, all_files: list[FileInfo] | None = None
+    ) -> list[FileInfo]:
         indexes = {f.file_index for f in self.db.split_files(t.hash, SplitFileStatus.BATCH)}
-        return [f for f in self.qbit.files(t.hash) if f.index in indexes]
+        return [f for f in all_files or self.qbit.files(t.hash) if f.index in indexes]
 
     def _check_batch(self, t: TorrentInfo, tracked: TrackedTorrent) -> None:
         files = self._batch_files(t)
@@ -206,29 +209,31 @@ class SplitRunner:
             self._check_offload(t, tracked)
 
     def _check_offload(self, t: TorrentInfo, tracked: TrackedTorrent) -> None:
-        if self.offload is None:  # no organize, no hook: the user frees space themselves
-            self._offloaded(t)
-            return
-
         future = self._offloads.get(t.hash)
         if future is None:
             state = self.db.get_split_state(t.hash)
             if state.retry_at and self.clock() < state.retry_at:
                 return
-            files = self._batch_files(t)
-            future = self._offloads[t.hash] = self._executor.submit(self.offload, t, tracked, files)
+            all_files = self.qbit.files(t.hash)
+            batch = self._batch_files(t, all_files)
+            future = self._offloads[t.hash] = self._executor.submit(
+                self.offload, t, tracked, batch, all_files
+            )
         if not future.done():
             return
 
         del self._offloads[t.hash]
         if (error := future.exception()) is not None:
             log.error("split offload failed", extra={"hash": t.hash, "error": str(error)})
-            self.notifier.send(
-                "split offload failed",
-                f"'{t.name}': {error}\nRetrying in {HOOK_RETRY_SECONDS // 60} minutes.",
-            )
+            if t.hash not in self._failing:
+                self._failing.add(t.hash)
+                self.notifier.send(
+                    "split offload failed",
+                    f"'{t.name}': {error}\nRetrying every {HOOK_RETRY_SECONDS // 60} minutes.",
+                )
             self.db.update_split_state(t.hash, retry_at=self.clock() + HOOK_RETRY_SECONDS)
             return
+        self._failing.discard(t.hash)
         self._offloaded(t)
 
     def _offloaded(self, t: TorrentInfo) -> None:

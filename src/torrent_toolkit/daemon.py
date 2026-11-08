@@ -9,7 +9,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 from torrent_toolkit.config import Settings
 from torrent_toolkit.db import Database, TorrentState, TrackedTorrent
+from torrent_toolkit.jobs import Jobs
 from torrent_toolkit.notify import Notifier
+from torrent_toolkit.organize.layout import Finder
+from torrent_toolkit.organize.organizer import Organizer, OrganizeResult
+from torrent_toolkit.organize.tmdb import Tmdb
 from torrent_toolkit.qbit import PRIORITY_SKIP, FileInfo, QbitClient, QbitError, TorrentInfo
 from torrent_toolkit.split.runner import SplitRunner, remove_finished, run_hook
 
@@ -26,6 +30,8 @@ TAG_REVIEW = "tk-review"
 FEATURE_TAGS = frozenset({TAG_SPLIT, TAG_ORGANIZE, TAG_SPOOF})
 
 LIVE_STATES = (TorrentState.METADATA, TorrentState.ACTIVE)
+ORGANIZE_RETRY_SECONDS = 600
+REVIEW_LIST_LIMIT = 20
 
 
 class Daemon:
@@ -38,22 +44,32 @@ class Daemon:
         *,
         disk_usage: Callable[[str], tuple[int, int]] | None = None,
         split_executor: ThreadPoolExecutor | None = None,
+        organize_executor: ThreadPoolExecutor | None = None,
+        finder: Finder | None = None,
         clock: Callable[[], float] | None = None,
     ):
         self.db = db
         self.qbit = qbit
         self.notifier = notifier
         self.settings = settings
+        clock_kw = {"clock": clock} if clock else {}
         self.split = SplitRunner(
             db,
             qbit,
             notifier,
             reserve=settings.split_reserve,
-            offload=self._split_offload if settings.split_hook else None,
+            offload=self._split_offload,
             disk_usage=disk_usage,
             executor=split_executor,
-            **({"clock": clock} if clock else {}),
+            **clock_kw,
         )
+        if finder is None and settings.tmdb_api_key:
+            finder = Tmdb(settings.tmdb_api_key, db)
+        self.organizer = Organizer(db, settings.library_path, settings.review_path, finder)
+        self.organize_jobs = Jobs(
+            "organize", ORGANIZE_RETRY_SECONDS, executor=organize_executor, **clock_kw
+        )
+        self._organize_failing: set[str] = set()
         # One worker thread: ticks never overlap and blocking API calls stay off the event loop.
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tick")
 
@@ -77,6 +93,7 @@ class Daemon:
                 pass
         self._executor.shutdown(wait=True)
         self.split.shutdown()
+        self.organize_jobs.shutdown()
 
     # --- one poll ---
 
@@ -98,6 +115,11 @@ class Daemon:
 
         active = [tr for tr in self.db.list_torrents((TorrentState.ACTIVE,)) if tr.hash in torrents]
         self._run_split([tr for tr in active if TAG_SPLIT in tr.features], torrents)
+        for tracked in active:
+            if TAG_SPLIT in tracked.features or TAG_SPOOF in tracked.features:
+                continue
+            if TAG_ORGANIZE in tracked.features:
+                self._run_organize(torrents[tracked.hash], tracked)
 
     # --- split ---
 
@@ -109,13 +131,79 @@ class Daemon:
             if self.split.finished(tracked.hash):
                 self._split_finished(torrents[tracked.hash], tracked)
 
-    def _split_offload(self, t: TorrentInfo, tracked: TrackedTorrent, files: list[FileInfo]):
-        run_hook(self.settings.split_hook, t, files)
+    def _split_offload(
+        self,
+        t: TorrentInfo,
+        tracked: TrackedTorrent,
+        batch: list[FileInfo],
+        all_files: list[FileInfo],
+    ) -> None:
+        """Runs in the split offload thread."""
+        if TAG_ORGANIZE in tracked.features:
+            names = {f.index: f.name for f in all_files}
+            result = self.organizer.organize(t.hash, t.save_path, names, [f.index for f in batch])
+            self._report_review(t, result)
+        elif self.settings.split_hook:
+            run_hook(self.settings.split_hook, t, batch)
+        # else: the user frees the space; the runner waits for it.
 
     def _split_finished(self, t: TorrentInfo, tracked: TrackedTorrent) -> None:
         remove_finished(self.qbit, t)
         self.db.set_torrent_state(t.hash, TorrentState.DONE)
         log.info("split torrent removed from qBittorrent", extra={"hash": t.hash})
+
+    # --- organize ---
+
+    def _run_organize(self, t: TorrentInfo, tracked: TrackedTorrent) -> None:
+        """Organize a normal (non-split, non-spoof) torrent once it has finished."""
+        finished, result, error = self.organize_jobs.collect(t.hash)
+        if finished:
+            if error is not None:
+                self._organize_failed(t, error)
+            else:
+                self._organize_failing.discard(t.hash)
+                self._report_review(t, result)
+                self._release(t)
+                return
+        if self.organize_jobs.running(t.hash) or t.progress < 1.0:
+            return
+        files = self.qbit.files(t.hash)
+        names = {f.index: f.name for f in files}
+        wanted = [f.index for f in files if f.priority > 0 and f.progress >= 1.0]
+        self.organize_jobs.submit(
+            t.hash, self.organizer.organize, t.hash, t.save_path, names, wanted
+        )
+
+    def _organize_failed(self, t: TorrentInfo, error: BaseException) -> None:
+        log.error("organize failed", extra={"hash": t.hash, "error": str(error)})
+        if t.hash not in self._organize_failing:
+            self._organize_failing.add(t.hash)
+            self.notifier.send(
+                "organize failed",
+                f"'{t.name}': {error}\nRetrying every {ORGANIZE_RETRY_SECONDS // 60} minutes.",
+            )
+
+    def _report_review(self, t: TorrentInfo, result: OrganizeResult) -> None:
+        if not result.review:
+            return
+        try:
+            self.qbit.add_tags(t.hash, TAG_REVIEW)
+        except QbitError as e:  # torrent may already be gone (spoof hand-off)
+            log.warning("could not tag for review", extra={"hash": t.hash, "error": str(e)})
+        lines = [f"- {path} ({reason})" for path, reason in result.review[:REVIEW_LIST_LIMIT]]
+        if len(result.review) > REVIEW_LIST_LIMIT:
+            lines.append(f"... and {len(result.review) - REVIEW_LIST_LIMIT} more")
+        self.notifier.send(
+            "files need review",
+            f"'{t.name}': {len(result.review)} file(s) moved to {self.settings.review_path}:\n"
+            + "\n".join(lines),
+        )
+
+    def _release(self, t: TorrentInfo) -> None:
+        """Done with a torrent that stays in qBittorrent."""
+        self.qbit.remove_tags(t.hash, TAG_SERVICE)
+        self.db.set_torrent_state(t.hash, TorrentState.DONE)
+        log.info("released", extra={"hash": t.hash, "torrent": t.name})
 
     # --- takeover ---
 

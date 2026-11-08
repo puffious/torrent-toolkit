@@ -40,6 +40,27 @@ MIGRATIONS: list[str] = [
         stall_notified  INTEGER NOT NULL DEFAULT 0
     );
     """,
+    # 3: organize
+    """
+    CREATE TABLE organized_files (
+        hash        TEXT NOT NULL,
+        file_index  INTEGER NOT NULL,
+        source      TEXT NOT NULL,
+        dest        TEXT,
+        action      TEXT NOT NULL,
+        reason      TEXT,
+        done_at     REAL NOT NULL,
+        PRIMARY KEY (hash, file_index)
+    );
+    CREATE TABLE tmdb_cache (
+        kind        TEXT NOT NULL,
+        title       TEXT NOT NULL,
+        year        INTEGER NOT NULL,
+        result      TEXT,
+        fetched_at  REAL NOT NULL,
+        PRIMARY KEY (kind, title, year)
+    );
+    """,
 ]
 
 
@@ -228,4 +249,48 @@ class Database:
             "UPDATE split_files SET status = ?, batch_no = COALESCE(?, batch_no) "
             "WHERE hash = ? AND file_index = ?",
             [(status, batch_no, hash, i) for i in indexes],
+        )
+
+    # --- organize ---
+
+    def organized_indexes(self, hash: str) -> set[int]:
+        rows = self.conn.execute("SELECT file_index FROM organized_files WHERE hash = ?", (hash,))
+        return {r[0] for r in rows}
+
+    def record_organized(
+        self,
+        hash: str,
+        file_index: int,
+        source: str,
+        dest: str | None,
+        action: str,
+        reason: str | None = None,
+    ) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO organized_files VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (hash, file_index, source, dest, action, reason, time.time()),
+        )
+
+    def organized_files(self, hash: str) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM organized_files WHERE hash = ? ORDER BY file_index", (hash,)
+        )
+        return [dict(r) for r in rows]
+
+    def tmdb_cache_get(
+        self, kind: str, title: str, year: int, max_age: float
+    ) -> tuple[bool, str | None]:
+        """`(hit, result_json)`; a cached miss is `(True, None)`."""
+        row = self.conn.execute(
+            "SELECT result, fetched_at FROM tmdb_cache WHERE kind = ? AND title = ? AND year = ?",
+            (kind, title, year),
+        ).fetchone()
+        if row is None or time.time() - row["fetched_at"] > max_age:
+            return False, None
+        return True, row["result"]
+
+    def tmdb_cache_put(self, kind: str, title: str, year: int, result: str | None) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO tmdb_cache VALUES (?, ?, ?, ?, ?)",
+            (kind, title, year, result, time.time()),
         )

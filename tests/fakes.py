@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
 
 from torrent_toolkit.qbit import PRIORITY_NORMAL, FileInfo, TorrentInfo
@@ -116,3 +117,35 @@ class FakeQbit:
 
     def version(self) -> str:
         return self._version
+
+
+class FakeDisk:
+    def __init__(self, total: int, free: int):
+        self.total = total
+        self.free = free
+
+    def __call__(self, path: str) -> tuple[int, int]:
+        return self.total, self.free
+
+
+class InlineExecutor:
+    """Runs offloads synchronously so tests are deterministic."""
+
+    def submit(self, fn, *args):
+        f = Future()
+        try:
+            f.set_result(fn(*args))
+        except Exception as e:
+            f.set_exception(e)
+        return f
+
+    def shutdown(self, wait=True):
+        pass
+
+
+class Clock:
+    def __init__(self):
+        self.now = 1_000_000.0
+
+    def __call__(self):
+        return self.now

@@ -129,7 +129,9 @@ Triggered per file: for normal torrents when the torrent completes; for split to
 <TK_LIBRARY_PATH>/shows/Show (Year)/Season 01/<original filename>
 ```
 
-**Move:** plain filesystem move into the mount — copy to `<dest>.tk-tmp`, rename to `<dest>`, delete source.
+**Move:** plain filesystem move into the mount — copy to `<dest>.tk-tmp`, rename to `<dest>`, delete source. Before moving, `movies/` or `shows/` must already exist in the library; otherwise the mount is assumed down and organize is retried later (create both folders once).
+
+Subtitles are renamed `<video stem>.<subtitle stem>.<ext>` unless already prefixed with the video name, because Jellyfin links subtitles by filename. Unknown file types (not video/subtitle/junk) go to review, never deleted.
 
 **Collisions:**
 
@@ -137,7 +139,7 @@ Triggered per file: for normal torrents when the torrent completes; for split to
 - Same name, different size → review.
 - Different name in the same folder (other quality) → keep both.
 
-**Review:** unidentified files move to `<TK_REVIEW_PATH>/<torrent name>/<original relative path>`; torrent gets `tk-review`; notification sent.
+**Review:** unidentified files move to `<TK_REVIEW_PATH>/<original relative path>` (single-file torrents get a folder named after the file); torrent gets `tk-review`; notification sent.
 
 **qBittorrent afterwards:** non-spoofed organized torrents stay in qBittorrent pointing at the old path (expected to error eventually — accepted). Tag `service` removed.
 
