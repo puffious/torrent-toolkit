@@ -4,12 +4,12 @@ import pytest
 
 from torrent_toolkit.daemon import TAG_SERVICE, Daemon
 from torrent_toolkit.db import Database, TorrentState
-from torrent_toolkit.qbit import PRIORITY_SKIP, QbitError
+from torrent_toolkit.qbit import PRIORITY_NORMAL, PRIORITY_SKIP, QbitError
 
 
 @pytest.fixture
-def daemon(db, qbit, notifier):
-    return Daemon(db, qbit, notifier)
+def daemon(db, qbit, notifier, settings):
+    return Daemon(db, qbit, notifier, settings, disk_usage=lambda p: (10**12, 10**12))
 
 
 def test_untagged_torrents_ignored(daemon, qbit, db):
@@ -38,19 +38,20 @@ def test_running_torrent_not_restarted_after_user_pause(daemon, qbit):
     assert ("start", "a") not in qbit.calls
 
 
-def test_split_takeover_skips_all_files_and_does_not_start(daemon, qbit, notifier):
+def test_split_takeover_skips_everything_then_starts_first_batch(daemon, qbit, notifier):
     qbit.add("a", tags={"split"}, files=[("1.mkv", 10), ("2.mkv", 20)])
     daemon.tick()
-    assert qbit.priorities("a") == [PRIORITY_SKIP, PRIORITY_SKIP]
-    assert ("start", "a") not in qbit.calls
+    first_priority_call = next(c for c in qbit.calls if c[0] == "set_file_priority")
+    assert first_priority_call == ("set_file_priority", "a", (0, 1), PRIORITY_SKIP)
+    assert qbit.priorities("a") == [PRIORITY_NORMAL, PRIORITY_NORMAL]
+    assert ("start", "a") in qbit.calls
     assert notifier.sent == []
 
 
 def test_split_found_running_is_notified(daemon, qbit, notifier):
     qbit.add("a", tags={"split"}, state="downloading", files=[("1.mkv", 10)])
     daemon.tick()
-    assert qbit.priorities("a") == [PRIORITY_SKIP]
-    assert notifier.sent and notifier.sent[0][0] == "split torrent was running"
+    assert notifier.sent[0][0] == "split torrent was running"
 
 
 def test_magnet_waits_for_metadata(daemon, qbit, db):
@@ -94,15 +95,15 @@ def test_vanished_torrent_marked_gone(daemon, qbit, db):
     assert db.get_torrent("a").state == TorrentState.GONE
 
 
-def test_state_survives_restart(tmp_path, qbit, notifier):
+def test_state_survives_restart(tmp_path, qbit, notifier, settings):
     db1 = Database(tmp_path / "t.db")
     qbit.add("a", tags={"organize"}, files=[("x.mkv", 10)])
-    Daemon(db1, qbit, notifier).tick()
+    Daemon(db1, qbit, notifier, settings).tick()
     db1.close()
 
     db2 = Database(tmp_path / "t.db")
     qbit.calls.clear()
-    Daemon(db2, qbit, notifier).tick()
+    Daemon(db2, qbit, notifier, settings).tick()
     assert db2.get_torrent("a").state == TorrentState.ACTIVE
     assert notifier.sent == []  # not treated as orphan
     assert ("start", "a") not in qbit.calls

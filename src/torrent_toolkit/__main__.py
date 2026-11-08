@@ -22,7 +22,7 @@ log = logging.getLogger("torrent_toolkit")
 async def run(settings: config.Settings) -> None:
     db = Database(settings.db_path)
     qbit = Qbit(settings.qbit_url, settings.qbit_user, settings.qbit_pass)
-    daemon = Daemon(db, qbit, Notifier(settings.notify_urls))
+    daemon = Daemon(db, qbit, Notifier(settings.notify_urls), settings)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

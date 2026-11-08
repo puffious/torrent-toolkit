@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from fakes import FakeQbit  # noqa: E402
 
+from torrent_toolkit.config import Settings  # noqa: E402
 from torrent_toolkit.db import Database  # noqa: E402
 
 
@@ -33,3 +34,8 @@ def qbit():
 @pytest.fixture
 def notifier():
     return RecordingNotifier()
+
+
+@pytest.fixture
+def settings(tmp_path):
+    return Settings(qbit_url="http://qbit", data_dir=tmp_path, split_reserve=0)

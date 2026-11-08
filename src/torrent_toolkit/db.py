@@ -20,6 +20,26 @@ MIGRATIONS: list[str] = [
         updated_at  REAL NOT NULL
     );
     """,
+    # 2: split
+    """
+    CREATE TABLE split_files (
+        hash        TEXT NOT NULL REFERENCES torrents(hash) ON DELETE CASCADE,
+        file_index  INTEGER NOT NULL,
+        size        INTEGER NOT NULL,
+        status      TEXT NOT NULL,
+        batch_no    INTEGER,
+        PRIMARY KEY (hash, file_index)
+    );
+    CREATE TABLE split_state (
+        hash            TEXT PRIMARY KEY REFERENCES torrents(hash) ON DELETE CASCADE,
+        phase           TEXT NOT NULL,
+        batch_no        INTEGER NOT NULL DEFAULT 0,
+        last_free       INTEGER,
+        last_growth_at  REAL,
+        retry_at        REAL,
+        stall_notified  INTEGER NOT NULL DEFAULT 0
+    );
+    """,
 ]
 
 
@@ -29,6 +49,41 @@ class TorrentState:
     DONE = "done"  # daemon finished with it
     ORPHAN = "orphan"  # had `service` tag but no DB record; left alone
     GONE = "gone"  # vanished from qBittorrent while active
+
+
+class SplitPhase:
+    QUEUED = "queued"  # waiting for its turn / first batch
+    DOWNLOADING = "downloading"  # a batch is downloading
+    OFFLOADING = "offloading"  # batch complete; organize / hook running
+    WAITING_SPACE = "waiting_space"  # waiting for free space before the next batch
+    FINISHED = "finished"  # every file downloaded (or skipped) and offloaded
+
+
+class SplitFileStatus:
+    PENDING = "pending"
+    BATCH = "batch"  # in the current batch
+    DONE = "done"  # downloaded and offloaded
+    SKIPPED = "skipped"  # can never fit
+
+
+@dataclass
+class SplitFile:
+    hash: str
+    file_index: int
+    size: int
+    status: str
+    batch_no: int | None
+
+
+@dataclass
+class SplitState:
+    hash: str
+    phase: str
+    batch_no: int
+    last_free: int | None
+    last_growth_at: float | None
+    retry_at: float | None
+    stall_notified: bool
 
 
 @dataclass
@@ -121,3 +176,56 @@ class Database:
 
     def delete_torrent(self, hash: str) -> None:
         self.conn.execute("DELETE FROM torrents WHERE hash = ?", (hash,))
+
+    # --- split ---
+
+    def init_split(self, hash: str, files: list[tuple[int, int]], skipped: set[int]) -> None:
+        with self.conn:
+            self.conn.execute("BEGIN")
+            self.conn.executemany(
+                "INSERT INTO split_files (hash, file_index, size, status) VALUES (?, ?, ?, ?)",
+                [
+                    (
+                        hash,
+                        i,
+                        size,
+                        SplitFileStatus.SKIPPED if i in skipped else SplitFileStatus.PENDING,
+                    )
+                    for i, size in files
+                ],
+            )
+            self.conn.execute(
+                "INSERT INTO split_state (hash, phase) VALUES (?, ?)", (hash, SplitPhase.QUEUED)
+            )
+
+    def get_split_state(self, hash: str) -> SplitState | None:
+        row = self.conn.execute("SELECT * FROM split_state WHERE hash = ?", (hash,)).fetchone()
+        if row is None:
+            return None
+        return SplitState(**{**dict(row), "stall_notified": bool(row["stall_notified"])})
+
+    def update_split_state(self, hash: str, **fields) -> None:
+        if "stall_notified" in fields:
+            fields["stall_notified"] = int(fields["stall_notified"])
+        assigns = ", ".join(f"{k} = ?" for k in fields)
+        self.conn.execute(
+            f"UPDATE split_state SET {assigns} WHERE hash = ?", (*fields.values(), hash)
+        )
+
+    def split_files(self, hash: str, status: str | None = None) -> list[SplitFile]:
+        sql = "SELECT * FROM split_files WHERE hash = ?"
+        args: tuple = (hash,)
+        if status:
+            sql += " AND status = ?"
+            args += (status,)
+        rows = self.conn.execute(sql + " ORDER BY file_index", args)
+        return [SplitFile(**dict(r)) for r in rows]
+
+    def set_split_files_status(
+        self, hash: str, indexes: list[int], status: str, batch_no: int | None = None
+    ) -> None:
+        self.conn.executemany(
+            "UPDATE split_files SET status = ?, batch_no = COALESCE(?, batch_no) "
+            "WHERE hash = ? AND file_index = ?",
+            [(status, batch_no, hash, i) for i in indexes],
+        )

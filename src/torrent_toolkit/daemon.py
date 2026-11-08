@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
+from torrent_toolkit.config import Settings
 from torrent_toolkit.db import Database, TorrentState, TrackedTorrent
 from torrent_toolkit.notify import Notifier
-from torrent_toolkit.qbit import PRIORITY_SKIP, QbitClient, QbitError, TorrentInfo
+from torrent_toolkit.qbit import PRIORITY_SKIP, FileInfo, QbitClient, QbitError, TorrentInfo
+from torrent_toolkit.split.runner import SplitRunner, remove_finished, run_hook
 
 log = logging.getLogger(__name__)
 
@@ -26,10 +29,31 @@ LIVE_STATES = (TorrentState.METADATA, TorrentState.ACTIVE)
 
 
 class Daemon:
-    def __init__(self, db: Database, qbit: QbitClient, notifier: Notifier):
+    def __init__(
+        self,
+        db: Database,
+        qbit: QbitClient,
+        notifier: Notifier,
+        settings: Settings,
+        *,
+        disk_usage: Callable[[str], tuple[int, int]] | None = None,
+        split_executor: ThreadPoolExecutor | None = None,
+        clock: Callable[[], float] | None = None,
+    ):
         self.db = db
         self.qbit = qbit
         self.notifier = notifier
+        self.settings = settings
+        self.split = SplitRunner(
+            db,
+            qbit,
+            notifier,
+            reserve=settings.split_reserve,
+            offload=self._split_offload if settings.split_hook else None,
+            disk_usage=disk_usage,
+            executor=split_executor,
+            **({"clock": clock} if clock else {}),
+        )
         # One worker thread: ticks never overlap and blocking API calls stay off the event loop.
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tick")
 
@@ -52,6 +76,7 @@ class Daemon:
             except TimeoutError:
                 pass
         self._executor.shutdown(wait=True)
+        self.split.shutdown()
 
     # --- one poll ---
 
@@ -69,12 +94,28 @@ class Daemon:
             if tracked is None:
                 continue
             if tracked.state == TorrentState.METADATA and t.has_metadata:
-                tracked = self._activate(t, tracked)
-            if tracked.state == TorrentState.ACTIVE:
-                self.process(t, tracked)
+                self._activate(t, tracked)
 
-    def process(self, t: TorrentInfo, tracked: TrackedTorrent) -> None:
-        """Per-tick feature work for an active torrent (filled in by later milestones)."""
+        active = [tr for tr in self.db.list_torrents((TorrentState.ACTIVE,)) if tr.hash in torrents]
+        self._run_split([tr for tr in active if TAG_SPLIT in tr.features], torrents)
+
+    # --- split ---
+
+    def _run_split(self, active: list[TrackedTorrent], torrents: dict[str, TorrentInfo]) -> None:
+        head = self.split.head(active)
+        if head is not None:
+            self.split.step(torrents[head.hash], head)
+        for tracked in active:
+            if self.split.finished(tracked.hash):
+                self._split_finished(torrents[tracked.hash], tracked)
+
+    def _split_offload(self, t: TorrentInfo, tracked: TrackedTorrent, files: list[FileInfo]):
+        run_hook(self.settings.split_hook, t, files)
+
+    def _split_finished(self, t: TorrentInfo, tracked: TrackedTorrent) -> None:
+        remove_finished(self.qbit, t)
+        self.db.set_torrent_state(t.hash, TorrentState.DONE)
+        log.info("split torrent removed from qBittorrent", extra={"hash": t.hash})
 
     # --- takeover ---
 

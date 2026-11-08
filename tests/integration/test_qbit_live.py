@@ -30,7 +30,7 @@ def test_identity(live):
     assert live.listen_port() > 0
 
 
-def test_takeover_of_paused_magnet(live, db, notifier):
+def test_takeover_of_paused_magnet(live, db, notifier, settings):
     info_hash = secrets.token_hex(20)
     live._client.torrents_add(
         urls=f"magnet:?xt=urn:btih:{info_hash}&dn=tk-test", tags="organize", is_stopped=True
@@ -40,7 +40,7 @@ def test_takeover_of_paused_magnet(live, db, notifier):
             if info_hash in live.poll():
                 break
             time.sleep(0.5)
-        Daemon(db, live, notifier).tick()
+        Daemon(db, live, notifier, settings).tick()
         assert db.get_torrent(info_hash).state == TorrentState.METADATA
         assert TAG_SERVICE in live.poll()[info_hash].tags
     finally:

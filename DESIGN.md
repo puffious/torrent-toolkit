@@ -92,11 +92,11 @@ Downloads into the torrent's own save path; the daemon never changes it.
 2. Wait until every file in the batch has progress 1.0.
 3. Offload:
    - tagged `organize` → organize exactly those files (see §2);
-   - else if `TK_SPLIT_HOOK` set → run it with the list of completed files (absolute paths, one per line in a temp file passed as `$TK_FILES` and `$1`); non-zero exit → notify and retry later;
+   - else if `TK_SPLIT_HOOK` set → run it via `sh -c` with the list of completed files (absolute paths, one per line, in a temp file passed as `$TK_FILES` and `$1`; also `$TK_SAVE_PATH`, `$TK_TORRENT_NAME`, `$TK_TORRENT_HASH`); non-zero exit → notify and retry after 10 minutes;
    - else → wait for the user to free space.
    Only completed files are ever passed on; `*.parts` and `*.!qB` are never included.
 4. Set the offloaded files to "do not download" (same torrent keeps going; boundary pieces go to `.parts`).
-5. Wait for space to come back: start the next batch when `capacity ≥ remaining size`, or free space has stopped growing for 5 minutes and `capacity ≥ smallest remaining file`.
+5. Wait for space to come back: start the next batch when `capacity ≥ remaining size`, or free space has stopped growing for 5 minutes and `capacity ≥ smallest remaining file`. If nothing fits once space has settled, notify once and keep waiting.
 
 **After the last batch:** `spoof` → hand off (§3). Otherwise remove the torrent from qBittorrent (keep files) and delete leftover `.parts` files.
 
