@@ -40,7 +40,7 @@ async def run(settings: config.Settings) -> None:
 
     server = uvicorn.Server(
         uvicorn.Config(
-            create_app(db),
+            create_app(db, spoofer),
             host="0.0.0.0",
             port=settings.http_port,
             log_config=None,

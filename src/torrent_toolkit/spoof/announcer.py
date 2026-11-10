@@ -64,11 +64,11 @@ async def announce(
                 raise AnnounceError(f"HTTP {resp.status_code}")
             return parse_response(resp.content), base
         except (httpx.HTTPError, AnnounceError, OSError) as e:
-            errors.append(f"{_redact(base)}: {e}")
+            errors.append(f"{redact(base)}: {e}")
     raise AnnounceError("; ".join(errors) or "no HTTP tracker")
 
 
-def _redact(url: str) -> str:
+def redact(url: str) -> str:
     """Hide passkeys in logs/notifications."""
     u = httpx.URL(url)
     return f"{u.scheme}://{u.host}{':' + str(u.port) if u.port else ''}/…"
