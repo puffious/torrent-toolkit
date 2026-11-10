@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 MIGRATIONS: list[str] = [
@@ -61,6 +62,38 @@ MIGRATIONS: list[str] = [
         PRIMARY KEY (kind, title, year)
     );
     """,
+    # 4: spoof + organize after a torrent left qBittorrent
+    """
+    CREATE TABLE spoofs (
+        hash            TEXT PRIMARY KEY,
+        name            TEXT NOT NULL,
+        torrent_path    TEXT NOT NULL,
+        info_hash       TEXT NOT NULL,
+        trackers        TEXT NOT NULL,
+        size            INTEGER NOT NULL,
+        piece_length    INTEGER NOT NULL,
+        uploaded        INTEGER NOT NULL,
+        speed           INTEGER NOT NULL,
+        forever         INTEGER NOT NULL,
+        port            INTEGER NOT NULL,
+        client_version  TEXT NOT NULL,
+        status          TEXT NOT NULL,
+        stop_reason     TEXT,
+        started_at      REAL NOT NULL,
+        last_announce   REAL,
+        interval        INTEGER,
+        seeders         INTEGER,
+        leechers        INTEGER,
+        last_error      TEXT
+    );
+    CREATE TABLE detached_organize (
+        hash        TEXT PRIMARY KEY,
+        name        TEXT NOT NULL,
+        save_path   TEXT NOT NULL,
+        files       TEXT NOT NULL,
+        created_at  REAL NOT NULL
+    );
+    """,
 ]
 
 
@@ -68,6 +101,7 @@ class TorrentState:
     METADATA = "metadata"  # taken over, waiting for the file list
     ACTIVE = "active"  # features running
     DONE = "done"  # daemon finished with it
+    DETACHED = "detached"  # removed from qBittorrent (spoof), still being organized
     ORPHAN = "orphan"  # had `service` tag but no DB record; left alone
     GONE = "gone"  # vanished from qBittorrent while active
 
@@ -105,6 +139,49 @@ class SplitState:
     last_growth_at: float | None
     retry_at: float | None
     stall_notified: bool
+
+
+class SpoofStatus:
+    PENDING = "pending"  # recorded; torrent not yet removed from qBittorrent
+    ACTIVE = "active"  # announcing (resumed after restarts)
+    FINISHED = "finished"  # hit target ratio / max duration
+    STOPPED = "stopped"  # stopped through the API
+    FAILED = "failed"  # tracker kept failing
+
+
+@dataclass
+class Spoof:
+    hash: str
+    name: str
+    torrent_path: str
+    info_hash: str
+    trackers: list[str]
+    size: int
+    piece_length: int
+    uploaded: int
+    speed: int
+    forever: bool
+    port: int
+    client_version: str
+    status: str
+    stop_reason: str | None
+    started_at: float
+    last_announce: float | None
+    interval: int | None
+    seeders: int | None
+    leechers: int | None
+    last_error: str | None
+
+    @property
+    def ratio(self) -> float:
+        return self.uploaded / self.size if self.size else 0.0
+
+
+def _row_to_spoof(row: sqlite3.Row) -> Spoof:
+    d = dict(row)
+    d["trackers"] = json.loads(d["trackers"])
+    d["forever"] = bool(d["forever"])
+    return Spoof(**d)
 
 
 @dataclass
@@ -193,6 +270,12 @@ class Database:
         self.conn.execute(
             "UPDATE torrents SET name = ?, save_path = ?, updated_at = ? WHERE hash = ?",
             (name, save_path, time.time(), hash),
+        )
+
+    def set_torrent_features(self, hash: str, features: frozenset[str]) -> None:
+        self.conn.execute(
+            "UPDATE torrents SET features = ?, updated_at = ? WHERE hash = ?",
+            (",".join(sorted(features)), time.time(), hash),
         )
 
     def delete_torrent(self, hash: str) -> None:
@@ -294,3 +377,59 @@ class Database:
             "INSERT OR REPLACE INTO tmdb_cache VALUES (?, ?, ?, ?, ?)",
             (kind, title, year, result, time.time()),
         )
+
+    # --- spoof ---
+
+    def add_spoof(self, spoof: Spoof) -> None:
+        d = asdict(spoof)
+        d["trackers"] = json.dumps(d["trackers"])
+        d["forever"] = int(d["forever"])
+        cols = ", ".join(d)
+        marks = ", ".join("?" * len(d))
+        self.conn.execute(
+            f"INSERT OR REPLACE INTO spoofs ({cols}) VALUES ({marks})", tuple(d.values())
+        )
+
+    def get_spoof(self, hash: str) -> Spoof | None:
+        row = self.conn.execute("SELECT * FROM spoofs WHERE hash = ?", (hash,)).fetchone()
+        return _row_to_spoof(row) if row else None
+
+    def list_spoofs(self, status: str | None = None) -> list[Spoof]:
+        if status:
+            rows = self.conn.execute(
+                "SELECT * FROM spoofs WHERE status = ? ORDER BY started_at", (status,)
+            )
+        else:
+            rows = self.conn.execute("SELECT * FROM spoofs ORDER BY started_at")
+        return [_row_to_spoof(r) for r in rows]
+
+    def update_spoof(self, hash: str, **fields) -> None:
+        if "forever" in fields:
+            fields["forever"] = int(fields["forever"])
+        if "trackers" in fields:
+            fields["trackers"] = json.dumps(fields["trackers"])
+        assigns = ", ".join(f"{k} = ?" for k in fields)
+        self.conn.execute(f"UPDATE spoofs SET {assigns} WHERE hash = ?", (*fields.values(), hash))
+
+    # --- detached organize ---
+
+    def add_detached(self, hash: str, name: str, save_path: str, files: dict[int, str]) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO detached_organize VALUES (?, ?, ?, ?, ?)",
+            (hash, name, save_path, json.dumps({str(k): v for k, v in files.items()}), time.time()),
+        )
+
+    def list_detached(self) -> list[tuple[str, str, str, dict[int, str]]]:
+        rows = self.conn.execute("SELECT * FROM detached_organize ORDER BY created_at")
+        return [
+            (
+                r["hash"],
+                r["name"],
+                r["save_path"],
+                {int(k): v for k, v in json.loads(r["files"]).items()},
+            )
+            for r in rows
+        ]
+
+    def delete_detached(self, hash: str) -> None:
+        self.conn.execute("DELETE FROM detached_organize WHERE hash = ?", (hash,))

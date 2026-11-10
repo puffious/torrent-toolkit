@@ -5,7 +5,7 @@ from __future__ import annotations
 from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
 
-from torrent_toolkit.qbit import PRIORITY_NORMAL, FileInfo, TorrentInfo
+from torrent_toolkit.qbit import PRIORITY_NORMAL, FileInfo, QbitError, TorrentInfo
 
 
 @dataclass
@@ -56,8 +56,13 @@ class FakeQbit:
         self.torrents[hash] = FakeTorrent(info, file_infos)
         return self.torrents[hash]
 
+    def _get(self, hash: str) -> FakeTorrent:
+        if hash not in self.torrents:
+            raise QbitError(f"NotFound404Error: torrent {hash} not found")
+        return self.torrents[hash]
+
     def update(self, hash: str, **changes) -> None:
-        t = self.torrents[hash]
+        t = self._get(hash)
         t.info = replace(t.info, **changes)
 
     def set_file_progress(self, hash: str, index: int, progress: float) -> None:
@@ -97,19 +102,20 @@ class FakeQbit:
         self.update(hash, state="stoppedDL")
 
     def add_tags(self, hash: str, *tags: str) -> None:
-        self.update(hash, tags=self.torrents[hash].info.tags | set(tags))
+        self.update(hash, tags=self._get(hash).info.tags | set(tags))
 
     def remove_tags(self, hash: str, *tags: str) -> None:
         self.update(hash, tags=self.torrents[hash].info.tags - set(tags))
 
     def export(self, hash: str) -> bytes:
-        return self.torrents[hash].torrent_bytes
+        return self._get(hash).torrent_bytes
 
     def trackers(self, hash: str) -> list[str]:
-        return list(self.torrents[hash].trackers)
+        return list(self._get(hash).trackers)
 
     def delete(self, hash: str, delete_files: bool) -> None:
         self.calls.append(("delete", hash, delete_files))
+        self._get(hash)
         del self.torrents[hash]
 
     def listen_port(self) -> int:

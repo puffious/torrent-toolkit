@@ -271,6 +271,10 @@ class SplitRunner:
 def remove_finished(qbit: QbitClient, t: TorrentInfo) -> None:
     """Drop a fully offloaded split torrent from qBittorrent and clean its `.parts` file."""
     qbit.delete(t.hash, delete_files=False)
+    remove_parts_file(t)
+
+
+def remove_parts_file(t: TorrentInfo) -> None:
     parts = Path(t.save_path) / f".{t.hash}.parts"
     try:
         parts.unlink(missing_ok=True)

@@ -15,6 +15,7 @@ from torrent_toolkit.daemon import Daemon
 from torrent_toolkit.db import Database
 from torrent_toolkit.notify import Notifier
 from torrent_toolkit.qbit import Qbit
+from torrent_toolkit.spoof.manager import SpoofManager
 
 log = logging.getLogger("torrent_toolkit")
 
@@ -22,7 +23,15 @@ log = logging.getLogger("torrent_toolkit")
 async def run(settings: config.Settings) -> None:
     db = Database(settings.db_path)
     qbit = Qbit(settings.qbit_url, settings.qbit_user, settings.qbit_pass)
-    daemon = Daemon(db, qbit, Notifier(settings.notify_urls), settings)
+    notifier = Notifier(settings.notify_urls)
+    daemon = Daemon(db, qbit, notifier, settings)
+    spoofer = SpoofManager(
+        db,
+        notifier,
+        target_ratio=settings.spoof_target_ratio,
+        max_duration=settings.spoof_max_duration,
+        jitter=settings.spoof_jitter,
+    )
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -41,7 +50,7 @@ async def run(settings: config.Settings) -> None:
     server.install_signal_handlers = lambda: None  # we own signal handling
     api_task = asyncio.create_task(server.serve())
 
-    await daemon.run(stop)
+    await asyncio.gather(daemon.run(stop), spoofer.run(stop))
     server.should_exit = True
     await api_task
     db.close()
