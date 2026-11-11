@@ -34,7 +34,7 @@ services:
       - TK_SPOOF_JITTER=40%
       - TK_SPOOF_TARGET_RATIO=2.0
       - TK_SPOOF_MAX_DURATION=14d
-      # - TK_SPLIT_HOOK=rclone move --files-from "$TK_FILES" / remote:dump
+      # - TK_SPLIT_HOOK=rclone move --files-from-raw "$$TK_FILES" / remote:incoming
       # - TK_NOTIFY_URLS=ntfy://ntfy.sh/my-topic,discord://id/token
     volumes:
       - ./toolkit:/config
