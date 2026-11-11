@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from torrent_toolkit.arr import Arr
 from torrent_toolkit.db import Database
 from torrent_toolkit.organize.layout import MOVIES_DIR, SHOWS_DIR, Action, Finder, Planner
 from torrent_toolkit.organize.mover import Collision, move_file, move_to_review, prune_empty_dirs
@@ -26,11 +27,19 @@ class OrganizeResult:
 
 
 class Organizer:
-    def __init__(self, db: Database, library: Path, review: Path, finder: Finder | None):
+    def __init__(
+        self,
+        db: Database,
+        library: Path,
+        review: Path,
+        finder: Finder | None,
+        arr: Arr | None = None,
+    ):
         self.db = db
         self.library = library
         self.review = review
-        self.planner = Planner(library, finder)
+        self.arr = arr if arr is not None and arr.enabled else None
+        self.planner = Planner(library, finder, self.arr)
 
     def check_library(self) -> None:
         missing = [d for d in (MOVIES_DIR, SHOWS_DIR) if not (self.library / d).is_dir()]
@@ -60,6 +69,7 @@ class Organizer:
         base = Path(save_path)
         result = OrganizeResult()
         touched_dirs: set[Path] = set()
+        moved_media: set[tuple[str, int]] = set()
 
         for i in sorted(indexes):
             if i in done:
@@ -87,6 +97,8 @@ class Organizer:
                         result.duplicates += 1
                     else:
                         result.moved += 1
+                        if plan.media:
+                            moved_media.add(plan.media)
                     self.db.record_organized(hash, i, str(src), str(plan.dest), outcome)
             else:
                 self._to_review(hash, i, rel, src, plan.reason or "", result)
@@ -94,6 +106,9 @@ class Organizer:
 
         for d in touched_dirs:
             prune_empty_dirs(d, base)
+        if self.arr:
+            for kind, tmdb_id in sorted(moved_media):
+                self.arr.rescan(kind, tmdb_id)
         log.info(
             "organized",
             extra={

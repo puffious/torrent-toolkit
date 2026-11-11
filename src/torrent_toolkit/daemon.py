@@ -7,6 +7,7 @@ import logging
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
+from torrent_toolkit.arr import Arr
 from torrent_toolkit.config import ConfigError, Settings, parse_speed
 from torrent_toolkit.db import Database, Spoof, SpoofStatus, TorrentState, TrackedTorrent
 from torrent_toolkit.jobs import Jobs
@@ -69,7 +70,12 @@ class Daemon:
         )
         if finder is None and settings.tmdb_api_key:
             finder = Tmdb(settings.tmdb_api_key, db)
-        self.organizer = Organizer(db, settings.library_path, settings.review_path, finder)
+        arr = Arr(
+            settings.sonarr_url, settings.sonarr_key, settings.radarr_url, settings.radarr_key
+        )
+        self.organizer = Organizer(
+            db, settings.library_path, settings.review_path, finder, arr if arr.enabled else None
+        )
         self.organize_jobs = Jobs(
             "organize", ORGANIZE_RETRY_SECONDS, executor=organize_executor, **clock_kw
         )

@@ -28,6 +28,7 @@ class Plan:
     action: Action
     dest: Path | None = None  # library destination for MOVE
     reason: str | None = None  # why REVIEW
+    media: tuple[str, int] | None = None  # ("movie" | "tv", tmdb id) for *arr rescans
 
 
 class Finder(Protocol):
@@ -44,10 +45,18 @@ def media_folder(m: Match) -> str:
     return sanitize(f"{m.title} ({m.year})" if m.year else m.title)
 
 
+class ArrFolders(Protocol):
+    """Folder names Sonarr/Radarr already use (see `torrent_toolkit.arr.Arr`)."""
+
+    def movie(self, tmdb_id: int) -> tuple[str, int] | None: ...
+    def series(self, tmdb_id: int): ...
+
+
 class Planner:
-    def __init__(self, library: Path, finder: Finder | None):
+    def __init__(self, library: Path, finder: Finder | None, arr: ArrFolders | None = None):
         self.library = library
         self.finder = finder
+        self.arr = arr
 
     def _match(self, g: Guess) -> tuple[Match | None, str | None]:
         if not g.title:
@@ -58,24 +67,33 @@ class Planner:
         m = self.finder.find(kind, g.title, g.year)
         return (m, None) if m else (None, f"no confident TMDB match for '{g.title}'")
 
+    def _media_root(self, g: Guess, m: Match) -> Path:
+        """Movie folder or show folder; the *arr's folder name wins when it tracks the title."""
+        if g.kind == "movie":
+            hit = self.arr.movie(m.tmdb_id) if self.arr else None
+            return self.library / MOVIES_DIR / (hit[0] if hit else media_folder(m))
+        series = self.arr.series(m.tmdb_id) if self.arr else None
+        return self.library / SHOWS_DIR / (series.folder if series else media_folder(m))
+
     def _media_dir(self, g: Guess, m: Match) -> tuple[Path | None, str | None]:
         """Directory a video goes into: movie folder or season folder."""
+        root = self._media_root(g, m)
         if g.kind == "movie":
-            return self.library / MOVIES_DIR / media_folder(m), None
+            return root, None
         if g.season is None or g.episode is None:
             return None, "episode without season/episode number"
-        return self.library / SHOWS_DIR / media_folder(m) / f"Season {g.season:02d}", None
-
-    def _media_root(self, g: Guess, m: Match) -> Path:
-        """Folder that owns extras: the movie folder or the show folder."""
-        top = MOVIES_DIR if g.kind == "movie" else SHOWS_DIR
-        return self.library / top / media_folder(m)
+        series = self.arr.series(m.tmdb_id) if self.arr else None
+        if series is not None:
+            season_dir = series.season_dir(g.season)
+            return (root / season_dir if season_dir else root), None
+        return root / f"Season {g.season:02d}", None
 
     def plan(self, names: dict[int, str]) -> dict[int, Plan]:
         """`names` maps file index → path relative to the save path (all files of the torrent)."""
         classes = {i: classify(n) for i, n in names.items()}
         plans: dict[int, Plan] = {}
         video_dirs: dict[int, Path] = {}
+        video_roots: dict[int, tuple[Path, tuple[str, int]]] = {}
 
         for i, n in names.items():
             if classes[i] is not FileClass.VIDEO:
@@ -86,8 +104,10 @@ class Planner:
             if d is None:
                 plans[i] = Plan(Action.REVIEW, reason=why)
                 continue
+            media = (m.kind, m.tmdb_id)
             video_dirs[i] = d
-            plans[i] = Plan(Action.MOVE, d / PurePosixPath(n).name)
+            video_roots[i] = (self._media_root(g, m), media)
+            plans[i] = Plan(Action.MOVE, d / PurePosixPath(n).name, media=media)
 
         for i, n in names.items():
             match classes[i]:
@@ -96,24 +116,26 @@ class Planner:
                 case FileClass.OTHER:
                     plans[i] = Plan(Action.REVIEW, reason="unknown file type")
                 case FileClass.EXTRA:
-                    plans[i] = self._plan_extra(n, names, video_dirs)
+                    plans[i] = self._plan_extra(n, names, video_roots)
                 case FileClass.SUBTITLE:
                     plans[i] = self._plan_subtitle(n, names, classes, video_dirs)
         return plans
 
-    def _plan_extra(self, name: str, names: dict[int, str], video_dirs: dict[int, Path]) -> Plan:
+    def _plan_extra(
+        self, name: str, names: dict[int, str], video_roots: dict[int, tuple[Path, tuple]]
+    ) -> Plan:
         filename = PurePosixPath(name).name
         g = guess(name)  # the path usually names the owning movie/show
         m, _ = self._match(g)
         if m:
-            return Plan(Action.MOVE, self._media_root(g, m) / "extras" / filename)
-        # Fall back to the largest identified video under the same top-level folder.
+            root = self._media_root(g, m)
+            return Plan(Action.MOVE, root / "extras" / filename, media=(m.kind, m.tmdb_id))
+        # Fall back to the one identified video under the same top-level folder.
         top = PurePosixPath(name).parts[0]
-        owners = [i for i in video_dirs if PurePosixPath(names[i]).parts[0] == top]
+        owners = {video_roots[i] for i in video_roots if PurePosixPath(names[i]).parts[0] == top}
         if len(owners) == 1:
-            d = video_dirs[owners[0]]
-            root = d.parent if d.name.startswith("Season ") else d
-            return Plan(Action.MOVE, root / "extras" / filename)
+            root, media = owners.pop()
+            return Plan(Action.MOVE, root / "extras" / filename, media=media)
         return Plan(Action.REVIEW, reason="extra without an identifiable owner")
 
     def _plan_subtitle(
