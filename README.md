@@ -24,7 +24,7 @@ See [DESIGN.md](DESIGN.md) for the full behavior.
 2. Mount the same host folders at the **same paths** in qBittorrent and the toolkit (e.g. `/data` for downloads, `/mount` for the rclone mount).
 3. Create `movies/` and `shows/` in the library root once. The toolkit refuses to organize if neither exists — that is how it detects a dead rclone mount.
 4. Get a free [TMDB API key](https://www.themoviedb.org/settings/api) (v3 key or v4 read token).
-5. Run it — see [`docker-compose.example.yml`](docker-compose.example.yml) (uses the released image `ghcr.io/puffious/torrent-split`):
+5. Run it — see [`docker-compose.example.yml`](docker-compose.example.yml) (uses the released image `ghcr.io/puffious/torrent-toolkit`):
 
 ```sh
 docker compose -f docker-compose.example.yml up -d
@@ -102,7 +102,7 @@ uv run ruff check . && uv run ruff format --check .
 1. Bump `version` in `pyproject.toml`, run `uv lock`, commit.
 2. `git tag v<version> && git push origin main --tags`
 
-The `release` workflow checks the tag matches the version, runs the tests, publishes `ghcr.io/puffious/torrent-split:<version>` / `:latest` (amd64 + arm64) and creates the GitHub Release with the commit list. The repo is private, so the server needs `docker login ghcr.io` with a token that has `read:packages`.
+The `release` workflow checks the tag matches the version, runs the tests, publishes `ghcr.io/puffious/torrent-toolkit:<version>` / `:latest` (amd64 + arm64) and creates the GitHub Release with the commit list. The repo is private, so the server needs `docker login ghcr.io` with a token that has `read:packages`.
 
 End-to-end checklist for a real server: [docs/E2E.md](docs/E2E.md).
 

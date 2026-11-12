@@ -19,7 +19,7 @@ services:
     restart: unless-stopped
 
   torrent-toolkit:
-    image: ghcr.io/puffious/torrent-split:latest  # or `build: .`
+    image: ghcr.io/puffious/torrent-toolkit:latest  # or `build: .`
     depends_on: [qbittorrent]
     user: "1000:1000"
     environment:
