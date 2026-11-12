@@ -55,6 +55,10 @@ class SpoofManager:
         self._identities: dict[tuple[str, int], Identity] = {}
         self._rates: dict[str, float] = {}  # current bytes/s incl. jitter
         self._last_success: dict[str, float] = {}
+        # Announced counters are per session (since `event=started`), as in real clients;
+        # the all-time total stored in the DB is `session base + session uploaded`.
+        self._base: dict[str, int] = {}
+        self._session_up: dict[str, int] = {}
 
     # --- lifecycle ---
 
@@ -131,14 +135,15 @@ class SpoofManager:
             return 0.0
         return speed * (1 + self.rng.uniform(-self.jitter, self.jitter))
 
-    def _next_uploaded(self, s: Spoof, now: float) -> int:
-        """Uploaded total to report now: ratio-spoof's formula, with elapsed real time."""
+    def _next_session_uploaded(self, s: Spoof, now: float) -> int:
+        """Session `uploaded` to report now: ratio-spoof's formula, with elapsed real time."""
+        current = self._session_up.get(s.hash, 0)
         last = self._last_success.get(s.hash)
         rate = self._rates.get(s.hash, 0.0)
         if last is None or rate <= 0:
-            return s.uploaded
+            return current
         grown = rate * max(now - last, 0) + s.piece_length * self.rng.randint(1, 9)
-        return max(round_uploaded(s.uploaded + int(grown)), s.uploaded)
+        return max(round_uploaded(current + int(grown)), current)
 
     def _should_stop(self, s: Spoof, now: float) -> str | None:
         if s.forever:
@@ -155,6 +160,9 @@ class SpoofManager:
         failing_since: float | None = None
         s = self.db.get_spoof(hash)
         self._rates[hash] = self._roll_rate(s.speed)
+        self._base[hash] = s.uploaded
+        self._session_up[hash] = 0
+        self._last_success.pop(hash, None)
         log.info(
             "spoof announcing", extra={"hash": hash, "torrent": s.name, "uploaded": s.uploaded}
         )
@@ -164,9 +172,10 @@ class SpoofManager:
             if s is None or s.status != SpoofStatus.ACTIVE:
                 return
             now = self.clock()
-            uploaded = self._next_uploaded(s, now)
+            session_up = self._next_session_uploaded(s, now)
+            # A seeder that downloaded nothing this session: downloaded=0, left=0.
             query = build_query(
-                self._identity(s), bytes.fromhex(s.info_hash), uploaded, s.size, 0, event
+                self._identity(s), bytes.fromhex(s.info_hash), session_up, 0, 0, event
             )
             try:
                 resp, used = await announce(self.client, s.trackers, self._identity(s), query)
@@ -193,6 +202,8 @@ class SpoofManager:
 
             event, delay, failing_since = None, RETRY_MIN, None
             self._last_success[hash] = now
+            self._session_up[hash] = session_up
+            uploaded = self._base[hash] + session_up
             trackers = s.trackers
             if used != trackers[0]:
                 trackers = [used] + [t for t in trackers if t != used]
@@ -226,13 +237,13 @@ class SpoofManager:
         if s is None or hash not in self._last_success:
             return  # never announced in this session: nothing to stop
         now = self.clock()
-        uploaded = self._next_uploaded(s, now)
+        session_up = self._next_session_uploaded(s, now)
         query = build_query(
-            self._identity(s), bytes.fromhex(s.info_hash), uploaded, s.size, 0, "stopped", 0
+            self._identity(s), bytes.fromhex(s.info_hash), session_up, 0, 0, "stopped", 0
         )
         try:
             await announce(self.client, s.trackers, self._identity(s), query)
-            self.db.update_spoof(hash, uploaded=uploaded, last_announce=now)
+            self.db.update_spoof(hash, uploaded=self._base[hash] + session_up, last_announce=now)
         except AnnounceError as e:
             log.warning("stopped announce failed", extra={"hash": hash, "error": str(e)})
         self._last_success.pop(hash, None)

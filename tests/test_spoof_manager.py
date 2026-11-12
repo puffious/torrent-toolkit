@@ -125,9 +125,11 @@ async def test_first_and_regular_announces(make_manager, db, tracker):
     m = make_manager()
     await run_until(m, lambda: len(tracker.requests) >= 3)
     first, second, third = tracker.requests[:3]
+    # Per-session counters, like a restarted real client that already has the data
     assert first["event"] == "started"
-    assert first["uploaded"] == str(100 * MB)
-    assert first["downloaded"] == str(SIZE) and first["left"] == "0"
+    assert first["uploaded"] == "0"
+    assert first["downloaded"] == "0" and first["left"] == "0"
+    assert {r["downloaded"] for r in tracker.requests} == {"0"}
     assert first["port"] == "51413" and first["passkey"] == "abc"
     assert first["peer_id"].startswith("-qB5020-") and first["_ua"] == "qBittorrent/5.0.2"
     assert "event" not in second
@@ -139,7 +141,7 @@ async def test_first_and_regular_announces(make_manager, db, tracker):
     assert int(second["uploaded"]) % (16 * 1024) == 0
     assert int(third["uploaded"]) > int(second["uploaded"])
     s = db.get_spoof(HASH)
-    assert s.uploaded == int(tracker.requests[-1]["uploaded"])
+    assert s.uploaded == 100 * MB + int(tracker.requests[-1]["uploaded"])  # all-time total
     assert (s.interval, s.seeders, s.leechers) == (1800, 3, 1)
 
 
@@ -165,7 +167,8 @@ async def test_forever_with_zero_speed_keeps_uploaded_constant(make_manager, db,
     db.add_spoof(make_spoof(speed=0, forever=True, uploaded=5 * MB))
     m = make_manager(max_duration=1)
     await run_until(m, lambda: len(tracker.requests) >= 50)
-    assert {r["uploaded"] for r in tracker.requests} == {str(5 * MB)}
+    assert {r["uploaded"] for r in tracker.requests} == {"0"}
+    assert db.get_spoof(HASH).uploaded == 5 * MB
     assert db.get_spoof(HASH).status == SpoofStatus.ACTIVE
 
 
@@ -205,8 +208,9 @@ async def test_resume_after_restart(tmp_path, make_manager, tracker, notifier):
     m2 = make_manager(db2)
     await run_until(m2, lambda: len(tracker.requests) > before)
     resumed = tracker.requests[before]
-    assert resumed["event"] == "started" and resumed["uploaded"] == str(saved)
-    assert resumed["peer_id"] != tracker.requests[0]["peer_id"]  # new session
+    assert resumed["event"] == "started" and resumed["uploaded"] == "0"  # new session
+    assert resumed["peer_id"] != tracker.requests[0]["peer_id"]
+    assert db2.get_spoof(HASH).uploaded >= saved  # all-time total keeps growing from there
 
 
 async def test_shutdown_sends_stopped_but_stays_active(make_manager, db, tracker):

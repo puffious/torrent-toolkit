@@ -159,7 +159,7 @@ If the hand-off fails (no HTTP tracker, unreadable/mismatched `.torrent`), a not
 **Announcing** — a Python port of ratio-spoof's emulation/tracker logic:
 
 - Identity copied from the connected qBittorrent: listen port (`app/preferences`), version (`app/version`) → peer_id prefix `-qBXYZ0-` + 12 chars from ratio-spoof's alphabet, `User-Agent: qBittorrent/X.Y.Z`. One peer id/key per daemon session. Query parameter order, `key` (8 upper-case hex), `numwant=200` and headers come from ratio-spoof's `qbit-4.3.3` profile.
-- Continuous history: `downloaded = size`, `left = 0`, `uploaded` continues from the snapshot.
+- Per-session counters, like a real client restarted with complete data: every session starts with `event=started`, `uploaded=0`, `downloaded=0`, `left=0`; `uploaded` then grows from 0 and `downloaded` stays 0. The all-time total (qBittorrent's uploaded at hand-off + every session's upload) is kept in the DB for the ratio stop condition and `/status`. Reporting the old totals or `downloaded = size` on `started` could be credited again by trackers that count a new peer's first announce.
 - Uploaded growth per announce (ratio-spoof formula): `rate × elapsed + piece_length × rand(1..9)`, rounded down to 16 KiB; nothing is added at speed 0.
 - `event=started` on the first announce of a session, no `event` on regular announces (ratio-spoof sends `started` every time; real clients don't), `event=stopped` with `numwant=0` when stopping.
 - HTTP(S) trackers only, tried in order; the one that answers moves to the front.
