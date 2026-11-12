@@ -71,4 +71,4 @@ async def announce(
 def redact(url: str) -> str:
     """Hide passkeys in logs/notifications."""
     u = httpx.URL(url)
-    return f"{u.scheme}://{u.host}{':' + str(u.port) if u.port else ''}/…"
+    return f"{u.scheme}://{u.host}{':' + str(u.port) if u.port else ''}/..."
