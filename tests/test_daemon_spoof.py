@@ -186,3 +186,29 @@ def test_pending_spoof_activated_when_torrent_gone(make_daemon, qbit, db, paths)
     db.update_spoof(h, status=SpoofStatus.PENDING)  # as if we crashed after the delete
     daemon.tick()
     assert db.get_spoof(h).status == SpoofStatus.ACTIVE
+
+
+def test_already_seeding_torrent_handed_off_on_tagging(make_daemon, qbit, db, paths):
+    save, _, _ = paths
+    daemon = make_daemon()
+    h = add_spoof_torrent(qbit, save, {"spoof-forever"}, uploaded=5000 * MB)
+    complete(qbit, h)
+    daemon.tick()  # not tagged spoof yet → untouched
+    assert h in qbit.torrents
+
+    qbit.add_tags(h, "spoof")
+    daemon.tick()
+    s = db.get_spoof(h)
+    assert s.status == SpoofStatus.ACTIVE and s.uploaded == 5000 * MB and s.forever
+    assert h not in qbit.torrents
+
+
+def test_paused_finished_torrent_not_restarted_before_handoff(make_daemon, qbit, db, paths):
+    save, _, _ = paths
+    daemon = make_daemon()
+    h = add_spoof_torrent(qbit, save, {"spoof"})
+    complete(qbit, h)
+    qbit.update(h, state="stoppedUP")
+    daemon.tick()
+    assert ("start", h) not in qbit.calls
+    assert db.get_spoof(h).status == SpoofStatus.ACTIVE

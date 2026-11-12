@@ -377,7 +377,7 @@ class Daemon:
                     "Add split torrents paused to avoid partial downloads and pre-allocation.",
                 )
             # The split runner enables the first batch and starts the torrent.
-        elif t.paused:
+        elif t.paused and t.progress < 1.0:  # finished torrents need no download
             self.qbit.start(t.hash)
 
         self.db.update_torrent(t.hash, name=t.name, save_path=t.save_path)
