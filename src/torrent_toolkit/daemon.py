@@ -9,13 +9,27 @@ from concurrent.futures import ThreadPoolExecutor
 
 from torrent_toolkit.arr import Arr
 from torrent_toolkit.config import ConfigError, Settings, parse_speed
-from torrent_toolkit.db import Database, Spoof, SpoofStatus, TorrentState, TrackedTorrent
+from torrent_toolkit.db import (
+    Database,
+    SplitFileStatus,
+    Spoof,
+    SpoofStatus,
+    TorrentState,
+    TrackedTorrent,
+)
 from torrent_toolkit.jobs import Jobs
 from torrent_toolkit.notify import Notifier
 from torrent_toolkit.organize.layout import Finder
 from torrent_toolkit.organize.organizer import Organizer, OrganizeResult
 from torrent_toolkit.organize.tmdb import Tmdb
-from torrent_toolkit.qbit import PRIORITY_SKIP, FileInfo, QbitClient, QbitError, TorrentInfo
+from torrent_toolkit.qbit import (
+    PRIORITY_SKIP,
+    FileInfo,
+    QbitClient,
+    QbitError,
+    TorrentInfo,
+    TorrentNotFound,
+)
 from torrent_toolkit.split.runner import SplitRunner, remove_finished, remove_parts_file, run_hook
 from torrent_toolkit.spoof.announcer import http_trackers
 from torrent_toolkit.spoof.bencode import BencodeError, parse_torrent
@@ -80,6 +94,7 @@ class Daemon:
             "organize", ORGANIZE_RETRY_SECONDS, executor=organize_executor, **clock_kw
         )
         self._organize_failing: set[str] = set()
+        self._errors: dict[tuple[str, str], str] = {}  # last error notified per torrent+step
         # One worker thread: ticks never overlap and blocking API calls stay off the event loop.
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tick")
 
@@ -110,42 +125,105 @@ class Daemon:
     def tick(self) -> None:
         torrents = self.qbit.poll()
         self._mark_gone(torrents)
+        readded = self._handle_readded(torrents)
         for t in torrents.values():
-            if not t.tags & FEATURE_TAGS and TAG_SERVICE not in t.tags:
+            if t.hash in readded or (not t.tags & FEATURE_TAGS and TAG_SERVICE not in t.tags):
                 continue
-            tracked = self.db.get_torrent(t.hash)
-            if tracked is None or (
-                tracked.state == TorrentState.ORPHAN and TAG_SERVICE not in t.tags
-            ):
-                tracked = self._takeover(t, known=tracked is not None)
-            if tracked is None:
-                continue
-            if tracked.state == TorrentState.METADATA and t.has_metadata:
-                self._activate(t, tracked)
+            self._guard(t, self._discover, t)
 
         active = [tr for tr in self.db.list_torrents((TorrentState.ACTIVE,)) if tr.hash in torrents]
         self._activate_pending_spoofs(torrents)
         self._run_split([tr for tr in active if TAG_SPLIT in tr.features], torrents)
         for tracked in active:
             t = torrents[tracked.hash]
-            if TAG_SPLIT in tracked.features:
+            if TAG_SPLIT in tracked.features or t.busy:
                 continue
-            if TAG_SPOOF in tracked.features:
-                if t.progress >= 1.0:
-                    self._handoff(t, tracked, organize_after=TAG_ORGANIZE in tracked.features)
-            elif TAG_ORGANIZE in tracked.features:
-                self._run_organize(t, tracked)
+            self._guard(t, self._process, t, tracked)
         self._run_detached()
+
+    def _discover(self, t: TorrentInfo) -> None:
+        tracked = self.db.get_torrent(t.hash)
+        if tracked is None or (tracked.state == TorrentState.ORPHAN and TAG_SERVICE not in t.tags):
+            tracked = self._takeover(t, known=tracked is not None)
+        if tracked is not None and tracked.state == TorrentState.METADATA and t.has_metadata:
+            self._activate(t, tracked)
+
+    def _process(self, t: TorrentInfo, tracked: TrackedTorrent) -> None:
+        if TAG_SPOOF in tracked.features:
+            if t.progress >= 1.0:
+                self._handoff(t, tracked, organize_after=TAG_ORGANIZE in tracked.features)
+        elif TAG_ORGANIZE in tracked.features:
+            self._run_organize(t, tracked)
+
+    def _guard(self, t: TorrentInfo, fn: Callable[..., object], *args: object) -> None:
+        """Run per-torrent work so one broken torrent can't stall all the others.
+
+        qBittorrent being unreachable still propagates (the run loop backs off); anything
+        else is logged, and notified once until the error changes or clears.
+        """
+        key = (t.hash, getattr(fn, "__name__", repr(fn)))
+        try:
+            fn(*args)
+        except TorrentNotFound:
+            log.info("torrent vanished mid-step", extra={"hash": t.hash})
+        except QbitError:
+            raise
+        except Exception as e:
+            message = f"{type(e).__name__}: {e}"
+            log.exception("torrent step failed", extra={"hash": t.hash, "torrent": t.name})
+            if self._errors.get(key) != message:
+                self._errors[key] = message
+                self.notifier.send("error", f"'{t.name}': {message}")
+        else:
+            self._errors.pop(key, None)
+
+    def _handle_readded(self, torrents: dict[str, TorrentInfo]) -> set[str]:
+        """Torrents added to qBittorrent again after the toolkit finished with them.
+
+        A running spoof for such a torrent is stopped (two clients must never announce the
+        same torrent). A re-added torrent that carries feature tags is treated as new, one
+        poll later, once the spoof task is gone.
+        """
+        readded: set[str] = set()
+        for t in torrents.values():
+            spoof = self.db.get_spoof(t.hash)
+            if (
+                spoof is not None
+                and spoof.status == SpoofStatus.ACTIVE
+                and t.added_on > spoof.started_at
+            ):
+                self.db.update_spoof(
+                    t.hash,
+                    status=SpoofStatus.STOPPED,
+                    stop_reason="torrent was added to qBittorrent again",
+                )
+                self.notifier.send(
+                    "spoof stopped",
+                    f"'{t.name}' is back in qBittorrent, so its spoof was stopped.",
+                )
+                readded.add(t.hash)
+                continue
+            tracked = self.db.get_torrent(t.hash)
+            if (
+                tracked is not None
+                and tracked.state in (TorrentState.DONE, TorrentState.GONE)
+                and t.added_on > tracked.created_at
+                and t.tags & FEATURE_TAGS
+            ):
+                log.info("re-added torrent, starting over", extra={"hash": t.hash})
+                self.db.forget_torrent(t.hash)
+        return readded
 
     # --- split ---
 
     def _run_split(self, active: list[TrackedTorrent], torrents: dict[str, TorrentInfo]) -> None:
         head = self.split.head(active)
-        if head is not None:
-            self.split.step(torrents[head.hash], head)
+        if head is not None and not torrents[head.hash].busy:
+            self._guard(torrents[head.hash], self.split.step, torrents[head.hash], head)
         for tracked in active:
             if self.split.finished(tracked.hash):
-                self._split_finished(torrents[tracked.hash], tracked)
+                t = torrents[tracked.hash]
+                self._guard(t, self._split_finished, t, tracked)
 
     def _split_offload(
         self,
@@ -157,16 +235,32 @@ class Daemon:
         """Runs in the split offload thread."""
         if TAG_ORGANIZE in tracked.features:
             names = {f.index: f.name for f in all_files}
-            result = self.organizer.organize(t.hash, t.save_path, names, [f.index for f in batch])
+            result = self.organizer.organize(t.hash, t.base_paths, names, [f.index for f in batch])
             self._report_review(t.hash, t.name, result)
         elif self.settings.split_hook:
             run_hook(self.settings.split_hook, t, batch)
         # else: the user frees the space; the runner waits for it.
 
     def _split_finished(self, t: TorrentInfo, tracked: TrackedTorrent) -> None:
-        if TAG_SPOOF in tracked.features and self._handoff(t, tracked, organize_after=False):
-            remove_parts_file(t)
+        downloaded = self.db.split_files(t.hash, SplitFileStatus.DONE)
+        skipped = self.db.split_files(t.hash, SplitFileStatus.SKIPPED)
+        if not downloaded:  # every file was too big: nothing happened, keep the torrent
+            self.notifier.send(
+                "split did nothing",
+                f"'{t.name}': no file fits on the disk; the torrent is left in qBittorrent.",
+            )
+            self._release(t)
             return
+        if TAG_SPOOF in tracked.features:
+            if skipped:  # spoof only fully downloaded torrents
+                self.notifier.send(
+                    "not spoofed",
+                    f"'{t.name}': {len(skipped)} file(s) were too big to download, so the "
+                    "torrent is incomplete and is not handed to the spoofer.",
+                )
+            elif self._handoff(t, tracked, organize_after=False):
+                remove_parts_file(t)
+                return
         remove_finished(self.qbit, t)
         self.db.set_torrent_state(t.hash, TorrentState.DONE)
         log.info("split torrent removed from qBittorrent", extra={"hash": t.hash})
@@ -285,7 +379,7 @@ class Daemon:
         names = {f.index: f.name for f in files}
         wanted = [f.index for f in files if f.priority > 0 and f.progress >= 1.0]
         self.organize_jobs.submit(
-            t.hash, self.organizer.organize, t.hash, t.save_path, names, wanted
+            t.hash, self.organizer.organize, t.hash, t.base_paths, names, wanted
         )
 
     def _run_detached(self) -> None:

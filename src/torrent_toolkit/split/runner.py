@@ -39,16 +39,29 @@ class DiskUsage:
 Offloader = Callable[[TorrentInfo, TrackedTorrent, list[FileInfo], list[FileInfo]], None]
 
 
+def locate(t: TorrentInfo, name: str) -> Path:
+    """Absolute path of a torrent file: save path, or the incomplete folder if it's there."""
+    for base in t.base_paths:
+        if (Path(base) / name).exists():
+            return Path(base) / name
+    return Path(t.save_path) / name
+
+
+def remaining_bytes(f: FileInfo) -> int:
+    """Disk space a file still needs (already-present data costs nothing)."""
+    return max(0, round(f.size * (1.0 - min(max(f.progress, 0.0), 1.0))))
+
+
 def run_hook(command: str, t: TorrentInfo, files: list[FileInfo]) -> None:
     """Run `TK_SPLIT_HOOK` with the completed files (absolute paths, one per line)."""
     with tempfile.NamedTemporaryFile("w", prefix="tk-files-", suffix=".txt", delete=False) as fh:
-        fh.writelines(str(Path(t.save_path) / f.name) + "\n" for f in files)
+        fh.writelines(str(locate(t, f.name)) + "\n" for f in files)
         list_path = fh.name
     try:
         env = {
             **os.environ,
             "TK_FILES": list_path,
-            "TK_SAVE_PATH": t.save_path,
+            "TK_SAVE_PATH": t.save_path,  # files may also be in the incomplete folder
             "TK_TORRENT_NAME": t.name,
             "TK_TORRENT_HASH": t.hash,
         }
@@ -125,9 +138,13 @@ class SplitRunner:
                 self._wait_space(t)
 
     def _init(self, t: TorrentInfo) -> None:
-        files = [(f.index, f.size) for f in self.qbit.files(t.hash)]
-        total, _ = self.disk_usage(t.save_path)
-        skipped = set(oversized(files, total - self.reserve))
+        infos = self.qbit.files(t.hash)
+        files = [(f.index, f.size) for f in infos]
+        total, _ = self.disk_usage(t.write_path)
+        # A file only "doesn't fit" if the part still missing is bigger than the disk.
+        skipped = set(
+            oversized([(f.index, remaining_bytes(f)) for f in infos], total - self.reserve)
+        )
         self.db.init_split(t.hash, files, skipped)
         log.info(
             "split initialised",
@@ -142,7 +159,7 @@ class SplitRunner:
             )
 
     def _capacity(self, t: TorrentInfo) -> tuple[int, int]:
-        _, free = self.disk_usage(t.save_path)
+        _, free = self.disk_usage(t.write_path)
         return free, free - self.reserve
 
     def _try_plan(self, t: TorrentInfo, settled: bool) -> None:
@@ -152,14 +169,22 @@ class SplitRunner:
             return
 
         free, capacity = self._capacity(t)
-        remaining = sum(f.size for f in pending)
+        capacity = max(capacity, 0)  # already-present files still fit on a full disk
+        progress = {f.index: f for f in self.qbit.files(t.hash)}
+        need = {
+            f.file_index: remaining_bytes(progress[f.file_index])
+            if f.file_index in progress
+            else f.size
+            for f in pending
+        }
+        remaining = sum(need.values())
         if capacity < remaining and not settled:
             return
-        batch = plan_batch([(f.file_index, f.size) for f in pending], capacity)
+        batch = plan_batch(need.items(), capacity)
         if not batch:
             state = self.db.get_split_state(t.hash)
             if settled and not state.stall_notified:
-                smallest = min(f.size for f in pending)
+                smallest = min(need.values())
                 self.notifier.send(
                     "split waiting for space",
                     f"'{t.name}': next file needs {smallest / 1024**3:.1f} GiB but only "
@@ -181,7 +206,7 @@ class SplitRunner:
             last_growth_at=None,
             stall_notified=False,
         )
-        size = sum(f.size for f in pending if f.file_index in batch)
+        size = sum(need[i] for i in batch)
         log.info(
             "split batch started",
             extra={

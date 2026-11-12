@@ -281,6 +281,14 @@ class Database:
     def delete_torrent(self, hash: str) -> None:
         self.conn.execute("DELETE FROM torrents WHERE hash = ?", (hash,))
 
+    def forget_torrent(self, hash: str) -> None:
+        """Drop everything known about a torrent (split state cascades) except its spoof."""
+        with self.conn:
+            self.conn.execute("BEGIN")
+            self.conn.execute("DELETE FROM torrents WHERE hash = ?", (hash,))
+            self.conn.execute("DELETE FROM organized_files WHERE hash = ?", (hash,))
+            self.conn.execute("DELETE FROM detached_organize WHERE hash = ?", (hash,))
+
     # --- split ---
 
     def init_split(self, hash: str, files: list[tuple[int, int]], skipped: set[int]) -> None:

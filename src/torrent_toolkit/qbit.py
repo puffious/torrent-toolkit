@@ -15,6 +15,8 @@ log = logging.getLogger(__name__)
 
 PAUSED_STATES = frozenset({"pausedDL", "pausedUP", "stoppedDL", "stoppedUP"})
 METADATA_STATES = frozenset({"metaDL", "forcedMetaDL"})
+# Files are being moved or verified: don't touch them until qBittorrent is done.
+BUSY_STATES = frozenset({"moving", "checkingUP", "checkingDL", "checkingResumeData", "allocating"})
 
 PRIORITY_SKIP = 0
 PRIORITY_NORMAL = 1
@@ -22,6 +24,10 @@ PRIORITY_NORMAL = 1
 
 class QbitError(Exception):
     pass
+
+
+class TorrentNotFound(QbitError):
+    """The torrent disappeared between the poll and the call (user deleted it)."""
 
 
 @dataclass(frozen=True)
@@ -35,10 +41,26 @@ class TorrentInfo:
     progress: float
     uploaded: int
     has_metadata: bool
+    added_on: float = 0.0
+    download_path: str = ""  # "Keep incomplete torrents in" folder, if enabled
 
     @property
     def paused(self) -> bool:
         return self.state in PAUSED_STATES
+
+    @property
+    def busy(self) -> bool:
+        return self.state in BUSY_STATES
+
+    @property
+    def write_path(self) -> str:
+        """Where new data lands: the incomplete folder if set, else the save path."""
+        return self.download_path or self.save_path
+
+    @property
+    def base_paths(self) -> list[str]:
+        """Folders a file of this torrent can be in, most likely first."""
+        return [p for p in dict.fromkeys([self.save_path, self.download_path]) if p]
 
     @classmethod
     def from_api(cls, hash: str, d: dict[str, Any]) -> TorrentInfo:
@@ -57,6 +79,8 @@ class TorrentInfo:
             progress=float(d.get("progress", 0.0)),
             uploaded=int(d.get("uploaded", 0) or 0),
             has_metadata=bool(has_metadata),
+            added_on=float(d.get("added_on", 0) or 0),
+            download_path=d.get("download_path", "") or "",
         )
 
 
@@ -107,6 +131,8 @@ class Qbit:
     def _call(self, fn, *args, **kwargs):
         try:
             return fn(*args, **kwargs)
+        except qbittorrentapi.exceptions.NotFound404Error as e:
+            raise TorrentNotFound(str(e)) from e
         except qbittorrentapi.exceptions.APIError as e:
             raise QbitError(f"{type(e).__name__}: {e}") from e
 

@@ -45,7 +45,7 @@ def test_classify(path, expected):
         ),
         (
             "The Office (US) Complete/Season 2/02x05 - Halloween.mkv",
-            Guess("episode", "The Office", None, 2, 5),
+            Guess("episode", "The Office", None, 2, 5, country="US"),
         ),
         ("Show.Name.S02.1080p/Show.Name.S02E01E02.mkv", Guess("episode", "Show Name", None, 2, 1)),
         ("Some.Show.S01.1080p/01.mkv", Guess("episode", "Some Show", None, 1, 1)),

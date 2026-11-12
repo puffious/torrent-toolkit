@@ -13,7 +13,7 @@ class FakeFinder:
         self.entries = {(k, normalize(t)): (t, y, i) for k, t, y, i in entries}
         self.calls = []
 
-    def find(self, kind, title, year):
+    def find(self, kind, title, year, country=None):
         self.calls.append((kind, title, year))
         hit = self.entries.get((kind, normalize(title)))
         if hit is None:

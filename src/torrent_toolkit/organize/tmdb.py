@@ -46,8 +46,17 @@ def _year(date: str | None) -> int | None:
     return int(date[:4]) if date and date[:4].isdigit() else None
 
 
-def pick(kind: str, title: str, year: int | None, results: list[dict]) -> Match | None:
-    """First result (TMDB relevance order) whose title matches and whose year is ±1."""
+def pick(
+    kind: str, title: str, year: int | None, results: list[dict], country: str | None = None
+) -> Match | None:
+    """First result (TMDB relevance order) whose title matches and whose year is ±1.
+
+    With a country hint (The.Office.US), shows from that country are preferred.
+    """
+    if country and kind == "tv":
+        local = [r for r in results if country in (r.get("origin_country") or [])]
+        if match := pick(kind, title, year, local):
+            return match
     for r in results:
         if kind == "movie":
             names = [r.get("title"), r.get("original_title")]
@@ -74,9 +83,11 @@ class Tmdb:
         if client is not None:
             self._client.headers.update(headers)
 
-    def find(self, kind: str, title: str, year: int | None) -> Match | None:
+    def find(
+        self, kind: str, title: str, year: int | None, country: str | None = None
+    ) -> Match | None:
         """`kind` is "movie" or "tv". Raises httpx errors on network failure."""
-        key = (kind, normalize(title), year or 0)
+        key = (kind, normalize(title) + (f"|{country}" if country else ""), year or 0)
         hit, cached = self.db.tmdb_cache_get(*key, max_age=HIT_TTL)
         if hit and cached is not None:
             return Match(**json.loads(cached))
@@ -84,9 +95,9 @@ class Tmdb:
         if hit:
             return None
 
-        match = self._search(kind, title, year)
+        match = self._search(kind, title, year, country)
         if match is None and year is not None:
-            match = self._search(kind, title, None)  # wrong year in the release name
+            match = self._search(kind, title, None, country)  # wrong year in the release name
             if match and match.year is not None and abs(match.year - year) > 1:
                 match = None
         self.db.tmdb_cache_put(*key, json.dumps(asdict(match)) if match else None)
@@ -96,10 +107,12 @@ class Tmdb:
         )
         return match
 
-    def _search(self, kind: str, title: str, year: int | None) -> Match | None:
+    def _search(
+        self, kind: str, title: str, year: int | None, country: str | None = None
+    ) -> Match | None:
         params = {**self._params, "query": title, "include_adult": "false"}
         if year is not None:
             params["year" if kind == "movie" else "first_air_date_year"] = str(year)
         resp = self._client.get(f"/search/{kind}", params=params)
         resp.raise_for_status()
-        return pick(kind, title, year, resp.json().get("results", []))
+        return pick(kind, title, year, resp.json().get("results", []), country)

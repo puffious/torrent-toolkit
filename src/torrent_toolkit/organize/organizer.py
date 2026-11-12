@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -40,6 +42,9 @@ class Organizer:
         self.review = review
         self.arr = arr if arr is not None and arr.enabled else None
         self.planner = Planner(library, finder, self.arr)
+        # Split offloads and normal organize jobs run in different threads; two torrents
+        # with the same movie must not race on the same destination.
+        self._lock = threading.Lock()
 
     def check_library(self) -> None:
         missing = [d for d in (MOVIES_DIR, SHOWS_DIR) if not (self.library / d).is_dir()]
@@ -52,22 +57,36 @@ class Organizer:
     def organize(
         self,
         hash: str,
-        save_path: str,
+        save_path: str | Sequence[str],
         all_files: dict[int, str],
         indexes: list[int],
     ) -> OrganizeResult:
         """Organize `indexes` out of `all_files` (index → relative path).
+
+        `save_path` may list several folders (save path, incomplete folder); each file is
+        taken from the first one that has it.
 
         All files are planned so subtitles and extras can be paired with videos that are
         in other split batches. Files already recorded as organized are skipped, so a rerun
         after a crash or failure is safe. Raises `LibraryUnavailable` or I/O / network errors;
         the caller retries later.
         """
+        with self._lock:
+            return self._organize(hash, save_path, all_files, indexes)
+
+    def _organize(
+        self,
+        hash: str,
+        save_path: str | Sequence[str],
+        all_files: dict[int, str],
+        indexes: list[int],
+    ) -> OrganizeResult:
         self.check_library()
         plans = self.planner.plan(all_files)
         done = self.db.organized_indexes(hash)
-        base = Path(save_path)
+        bases = [Path(save_path)] if isinstance(save_path, str) else [Path(p) for p in save_path]
         result = OrganizeResult()
+        touched_bases: dict[Path, Path] = {}
         touched_dirs: set[Path] = set()
         moved_media: set[tuple[str, int]] = set()
 
@@ -75,6 +94,7 @@ class Organizer:
             if i in done:
                 continue
             rel = all_files[i]
+            base = next((b for b in bases if (b / rel).exists()), bases[0])
             src = base / rel
             plan = plans[i]
 
@@ -103,9 +123,10 @@ class Organizer:
             else:
                 self._to_review(hash, i, rel, src, plan.reason or "", result)
             touched_dirs.add(src.parent)
+            touched_bases[src.parent] = base
 
         for d in touched_dirs:
-            prune_empty_dirs(d, base)
+            prune_empty_dirs(d, touched_bases[d])
         if self.arr:
             for kind, tmdb_id in sorted(moved_media):
                 self.arr.rescan(kind, tmdb_id)

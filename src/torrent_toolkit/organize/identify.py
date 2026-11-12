@@ -15,6 +15,7 @@ class Guess:
     year: int | None
     season: int | None = None
     episode: int | None = None  # first episode for multi-episode files
+    country: str | None = None  # "US", "GB": tells apart The Office (US) / (UK)
 
 
 def _first(value):
@@ -33,6 +34,32 @@ def _str(value) -> str | None:
     return str(value).strip() or None if value is not None else None
 
 
+def _country(value) -> str | None:
+    value = _first(value)
+    return getattr(value, "alpha2", None) if value is not None else None
+
+
+def guess_folder(path: str) -> Guess | None:
+    """What a folder path is about, e.g. the movie/show owning an `Extras/` folder."""
+    p = PurePosixPath(path)
+    if not p.parts or str(p) == ".":
+        return None
+    g = guessit(p.name if len(p.parts) == 1 else str(p), {"type": None})
+    title = _str(g.get("title"))
+    if not title:
+        return None
+    if g.get("type") == "episode" or g.get("season") is not None:
+        return Guess(
+            "episode",
+            title,
+            _int(g.get("year")),
+            _int(g.get("season")),
+            None,
+            _country(g.get("country")),
+        )
+    return Guess("movie", title, _int(g.get("year")), country=_country(g.get("country")))
+
+
 def guess(path: str) -> Guess:
     """Combine guessit on the bare filename and on the full relative path.
 
@@ -47,6 +74,10 @@ def guess(path: str) -> Guess:
     file_episode = _int(g_file.get("episode"))
     path_episode = _int(g_path.get("episode"))
     file_is_dated_movie = g_file.get("type") == "movie" and _int(g_file.get("year"))
+    country = _country(g_file.get("country") or g_path.get("country"))
+
+    if g_file.get("date") is not None:  # daily show (Show.2024.01.15): no season/episode
+        return Guess(kind="episode", title=_str(g_file.get("title")), year=None, country=country)
 
     if not file_is_dated_movie and (file_episode is not None or path_episode is not None):
         season = _int(g_file.get("season"))
@@ -59,6 +90,7 @@ def guess(path: str) -> Guess:
             year=_int(g_path.get("year")) or _int(g_file.get("year")),
             season=season,
             episode=file_episode if file_episode is not None else path_episode,
+            country=country,
         )
 
     title = _str(g_file.get("title")) or _str(g_path.get("title"))

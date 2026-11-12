@@ -5,7 +5,7 @@ from __future__ import annotations
 from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
 
-from torrent_toolkit.qbit import PRIORITY_NORMAL, FileInfo, QbitError, TorrentInfo
+from torrent_toolkit.qbit import PRIORITY_NORMAL, FileInfo, TorrentInfo, TorrentNotFound
 
 
 @dataclass
@@ -37,9 +37,18 @@ class FakeQbit:
         save_path: str = "/data/torrents",
         has_metadata: bool = True,
         uploaded: int = 0,
+        added_on: float = 0.0,
+        download_path: str = "",
+        progress: list[float] | None = None,
     ) -> FakeTorrent:
         file_infos = [
-            FileInfo(index=i, name=n, size=s, progress=0.0, priority=PRIORITY_NORMAL)
+            FileInfo(
+                index=i,
+                name=n,
+                size=s,
+                progress=progress[i] if progress else 0.0,
+                priority=PRIORITY_NORMAL,
+            )
             for i, (n, s) in enumerate(files)
         ]
         info = TorrentInfo(
@@ -52,13 +61,15 @@ class FakeQbit:
             progress=0.0,
             uploaded=uploaded,
             has_metadata=has_metadata,
+            added_on=added_on,
+            download_path=download_path,
         )
         self.torrents[hash] = FakeTorrent(info, file_infos)
         return self.torrents[hash]
 
     def _get(self, hash: str) -> FakeTorrent:
         if hash not in self.torrents:
-            raise QbitError(f"NotFound404Error: torrent {hash} not found")
+            raise TorrentNotFound(f"torrent {hash} not found")
         return self.torrents[hash]
 
     def update(self, hash: str, **changes) -> None:

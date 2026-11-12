@@ -74,6 +74,14 @@ Restart reconciliation: torrents carrying `service` but unknown to the DB are re
 
 `service` is removed when the daemon is done: organize finished (torrent stays in qBittorrent), split finished, or spoof hand-off (torrent removed from qBittorrent).
 
+## Robustness
+
+- **Per-torrent isolation:** each torrent's step runs guarded; an exception (bad path, unreadable file, …) is logged and notified once per torrent+step until it changes or clears, and every other torrent keeps being processed. Only "qBittorrent unreachable" pauses the whole loop (backoff).
+- **Busy torrents** (`moving`, `checking*`, `allocating`) are left alone until qBittorrent is done with them.
+- **Incomplete folder** ("Keep incomplete torrents in"): files are looked up in the save path, then the incomplete folder; split measures free space where new data lands.
+- **Re-added torrents** (qBittorrent `added_on` newer than the toolkit's record): an active spoof for it is stopped (two clients must never announce one torrent); a re-added torrent with feature tags is forgotten and taken over from scratch.
+- **Finished torrents are never started** on takeover (no stray qBittorrent announce right before a spoof hand-off).
+
 ---
 
 ## 1. Split
@@ -83,7 +91,7 @@ Downloads into the torrent's own save path; the daemon never changes it.
 **Batch planning** (at the start of each batch):
 
 - `capacity = measured_free_space(save_path) − TK_SPLIT_RESERVE` (`shutil.disk_usage`; real measurement handles the rclone VFS cache living on the same disk).
-- Pick from remaining files using first-fit-decreasing (largest first that fits) until capacity is used → as few batches as possible.
+- Pick from remaining files using first-fit-decreasing (largest first that fits) until capacity is used → as few batches as possible. Sizes are the bytes each file is still *missing* (`size × (1 − progress)`), so already-present data (cross-seeds, partial downloads) costs no space.
 - A file larger than the disk's total usable space is **skipped** and notified; all others still proceed.
 
 **Batch loop:**
@@ -98,7 +106,7 @@ Downloads into the torrent's own save path; the daemon never changes it.
 4. Set the offloaded files to "do not download" (same torrent keeps going; boundary pieces go to `.parts`).
 5. Wait for space to come back: start the next batch when `capacity ≥ remaining size`, or free space has stopped growing for 5 minutes and `capacity ≥ smallest remaining file`. If nothing fits once space has settled, notify once and keep waiting.
 
-**After the last batch:** `spoof` → hand off (§3). Otherwise remove the torrent from qBittorrent (keep files) and delete leftover `.parts` files.
+**After the last batch:** `spoof` → hand off (§3), unless files were skipped as oversized (the torrent isn't complete; notified, not spoofed). Otherwise remove the torrent from qBittorrent (keep files) and delete leftover `.parts` files. If *every* file was skipped, nothing was downloaded: the torrent is left in qBittorrent and released.
 
 Known risk, handled in testing: a peer requesting a piece of an offloaded file could put the torrent into an error state. Fallback if observed: force-recheck after each offload.
 
@@ -109,7 +117,8 @@ Triggered per file: for normal torrents when the torrent completes; for split to
 **Identification (per file):**
 
 - `guessit` on the file's full relative path inside the torrent (folder names give season/show context for packs).
-- TMDB search (movie: title + year; TV: title [+ year]); results cached per `(type, title, year)`.
+- TMDB search (movie: title + year; TV: title [+ year]); results cached per `(type, title, year)`. A country in the name (`The.Office.US`) prefers shows from that country.
+- Date-based episodes (`Show.2024.01.15`) have no season/episode → review.
 - Confident = normalized title similarity above threshold and year matches (±1) when known. Episodes additionally need season + episode numbers.
 - Not confident → review.
 
@@ -163,7 +172,7 @@ If the hand-off fails (no HTTP tracker, unreadable/mismatched `.torrent`), a not
 - Uploaded growth per announce (ratio-spoof formula): `rate × elapsed + piece_length × rand(1..9)`, rounded down to 16 KiB; nothing is added at speed 0.
 - `event=started` on the first announce of a session, no `event` on regular announces (ratio-spoof sends `started` every time; real clients don't), `event=stopped` with `numwant=0` when stopping.
 - HTTP(S) trackers only, tried in order; the one that answers moves to the front.
-- Follows the tracker's `interval` (1800 s if missing). Failures retry with 30 s → 900 s backoff; one notification per failure streak; after 24 h of failures the spoof is marked `failed`.
+- Follows the tracker's `interval` (1800 s if missing), never more often than `min interval` or 300 s (libtorrent's minimum). Failures retry with 30 s → 900 s backoff; one notification per failure streak; after 24 h of failures the spoof is marked `failed`.
 - Speed = tag override or `TK_SPOOF_SPEED`; re-rolled each interval as `speed × (1 ± random·JITTER)`. Speed 0 is never jittered.
 - Stop: ratio ≥ `TK_SPOOF_TARGET_RATIO` **or** elapsed ≥ `TK_SPOOF_MAX_DURATION`, whichever first → `event=stopped`, status `finished`. `spoof-forever` never stops on its own.
 - Every successful announce persists `uploaded`, `last_announce`, `interval`, seeders/leechers to SQLite.

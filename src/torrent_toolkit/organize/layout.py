@@ -9,12 +9,17 @@ from pathlib import Path, PurePosixPath
 from typing import Protocol
 
 from torrent_toolkit.organize.classify import FileClass, classify
-from torrent_toolkit.organize.identify import Guess, guess
+from torrent_toolkit.organize.identify import Guess, guess, guess_folder
 from torrent_toolkit.organize.tmdb import Match
 
 MOVIES_DIR = "movies"
 SHOWS_DIR = "shows"
 _SUBS_DIRS = {"subs", "subtitles", "sub", "subtitle"}
+_EXTRA_DIR = re.compile(
+    r"^(extras?|featurettes?|behind[ ._-]the[ ._-]scenes|deleted[ ._-]scenes|interviews?|"
+    r"trailers?|bonus|making[ ._-]of|specials? features?|shorts|scenes)$",
+    re.IGNORECASE,
+)
 
 
 class Action(StrEnum):
@@ -32,7 +37,9 @@ class Plan:
 
 
 class Finder(Protocol):
-    def find(self, kind: str, title: str, year: int | None) -> Match | None: ...
+    def find(
+        self, kind: str, title: str, year: int | None, country: str | None = None
+    ) -> Match | None: ...
 
 
 def sanitize(name: str) -> str:
@@ -64,7 +71,7 @@ class Planner:
         if self.finder is None:
             return None, "TMDB not configured"
         kind = "movie" if g.kind == "movie" else "tv"
-        m = self.finder.find(kind, g.title, g.year)
+        m = self.finder.find(kind, g.title, g.year, country=g.country)
         return (m, None) if m else (None, f"no confident TMDB match for '{g.title}'")
 
     def _media_root(self, g: Guess, m: Match) -> Path:
@@ -124,18 +131,29 @@ class Planner:
     def _plan_extra(
         self, name: str, names: dict[int, str], video_roots: dict[int, tuple[Path, tuple]]
     ) -> Plan:
-        filename = PurePosixPath(name).name
-        g = guess(name)  # the path usually names the owning movie/show
-        m, _ = self._match(g)
-        if m:
-            root = self._media_root(g, m)
-            return Plan(Action.MOVE, root / "extras" / filename, media=(m.kind, m.tmdb_id))
-        # Fall back to the one identified video under the same top-level folder.
-        top = PurePosixPath(name).parts[0]
-        owners = {video_roots[i] for i in video_roots if PurePosixPath(names[i]).parts[0] == top}
+        path = PurePosixPath(name)
+        # The folder the extra belongs to: whatever contains `Extras/`, `Featurettes/`, ...
+        owner_dir = path.parent
+        for k, part in enumerate(path.parts[:-1]):
+            if _EXTRA_DIR.match(part):
+                owner_dir = PurePosixPath(*path.parts[:k]) if k else PurePosixPath(".")
+                break
+        # 1. The identified videos in that folder (never the extra's own filename:
+        #    "Bloopers.mkv" is not a movie called Bloopers).
+        owners = {
+            video_roots[i]
+            for i in video_roots
+            if owner_dir == PurePosixPath(".") or owner_dir in PurePosixPath(names[i]).parents
+        }
         if len(owners) == 1:
             root, media = owners.pop()
-            return Plan(Action.MOVE, root / "extras" / filename, media=media)
+            return Plan(Action.MOVE, root / "extras" / path.name, media=media)
+        # 2. The folder name itself (e.g. extras-only torrents).
+        g = guess_folder(str(owner_dir))
+        m = self._match(g)[0] if g else None
+        if m:
+            root = self._media_root(g, m)
+            return Plan(Action.MOVE, root / "extras" / path.name, media=(m.kind, m.tmdb_id))
         return Plan(Action.REVIEW, reason="extra without an identifiable owner")
 
     def _plan_subtitle(
@@ -163,10 +181,15 @@ def _pair_subtitle(name: str, names: dict[int, str], classes: dict[int, FileClas
     sub = PurePosixPath(name)
     videos = {i: PurePosixPath(n) for i, n in names.items() if classes[i] is FileClass.VIDEO}
 
-    # 1. Same folder, subtitle named after the video: Movie.mkv + Movie.en.srt
-    for i, v in videos.items():
-        if v.parent == sub.parent and sub.name.startswith(v.stem):
-            return i
+    # 1. Same folder, subtitle named after the video: Movie.mkv + Movie.en.srt.
+    #    Longest stem wins: "Movie 2.en.srt" belongs to "Movie 2.mkv", not "Movie.mkv".
+    same = [
+        (len(v.stem), i)
+        for i, v in videos.items()
+        if v.parent == sub.parent and sub.name.startswith(v.stem)
+    ]
+    if same:
+        return max(same)[1]
 
     # 2. Subs/ folder: Subs/<video stem>/2_English.srt or Subs/English.srt
     parts = sub.parts[:-1]

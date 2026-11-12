@@ -23,6 +23,7 @@ RETRY_MIN = 30
 RETRY_MAX = 900
 GIVE_UP_AFTER = 24 * 3600
 STOP_TIMEOUT = 10.0
+MIN_ANNOUNCE_INTERVAL = 300  # libtorrent's min_announce_interval: never announce more often
 
 
 class SpoofManager:
@@ -70,13 +71,25 @@ class SpoofManager:
         await self.shutdown()
 
     def sync(self) -> None:
-        """Start loops for active spoofs that are not running (new hand-offs, restarts)."""
-        for s in self.db.list_spoofs(SpoofStatus.ACTIVE):
-            task = self._tasks.get(s.hash)
+        """Start loops for new/resumed spoofs; halt loops whose spoof was stopped elsewhere
+        (e.g. the daemon saw the torrent re-added to qBittorrent)."""
+        active = {s.hash for s in self.db.list_spoofs(SpoofStatus.ACTIVE)}
+        for hash, task in list(self._tasks.items()):
+            if task.done():
+                self._tasks.pop(hash)
+            elif hash not in active:
+                self._tasks.pop(hash)
+                asyncio.create_task(self._halt(hash, task))
+        for hash in active:
+            task = self._tasks.get(hash)
             if task is None or task.done():
-                self._tasks[s.hash] = asyncio.create_task(
-                    self._loop(s.hash), name=f"spoof-{s.hash}"
-                )
+                self._tasks[hash] = asyncio.create_task(self._loop(hash), name=f"spoof-{hash}")
+
+    async def _halt(self, hash: str, task: asyncio.Task) -> None:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await self._send_stopped(hash)
+        log.info("spoof halted", extra={"hash": hash})
 
     async def shutdown(self) -> None:
         """Stop announcing everything; spoofs stay active and resume on the next start."""
@@ -200,6 +213,7 @@ class SpoofManager:
                 delay = min(delay * 2, RETRY_MAX)
                 continue
 
+            interval = max(resp.interval, resp.min_interval or 0, MIN_ANNOUNCE_INTERVAL)
             event, delay, failing_since = None, RETRY_MIN, None
             self._last_success[hash] = now
             self._session_up[hash] = session_up
@@ -211,7 +225,7 @@ class SpoofManager:
                 hash,
                 uploaded=uploaded,
                 last_announce=now,
-                interval=resp.interval,
+                interval=interval,
                 seeders=resp.seeders,
                 leechers=resp.leechers,
                 last_error=None,
@@ -227,7 +241,7 @@ class SpoofManager:
                 log.info("spoof finished", extra={"hash": hash, "reason": reason})
                 await self._notify("spoof finished", f"'{s.name}': {reason} (ratio {s.ratio:.2f}).")
                 return
-            await self.sleep(resp.interval)
+            await self.sleep(interval)
 
     async def _notify(self, title: str, body: str) -> None:
         await asyncio.to_thread(self.notifier.send, title, body)
